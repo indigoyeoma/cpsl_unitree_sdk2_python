@@ -105,12 +105,16 @@ def test_camera_capture(args):
         camera.start()
         print("✓ Camera started successfully")
 
-        # Wait for first frames
-        print("\nWarming up camera...")
-        time.sleep(1.0)
+        # Wait for camera warmup
+        warmup_time = args.warmup_time
+        print(f"\nWarming up camera for {warmup_time} seconds...")
+        for i in range(warmup_time):
+            print(f"  {i+1}/{warmup_time}...", end='\r')
+            time.sleep(1.0)
+        print(f"  ✓ Camera ready" + " " * 20)
 
         # Capture test frames
-        print(f"\nCapturing {args.num_frames} frames...")
+        print(f"\nCapturing {args.num_frames} frames...", end='', flush=True)
 
         capture_times = []
         depth_stats = []
@@ -126,7 +130,6 @@ def test_camera_capture(args):
 
             # Check if valid
             if depth is None or depth.size == 0:
-                print(f"  Frame {i+1}: ❌ FAILED - No data")
                 continue
 
             # Compute statistics
@@ -141,13 +144,6 @@ def test_camera_capture(args):
                 'max': np.max(depth)
             })
 
-            print(f"  Frame {i+1}/{args.num_frames}: "
-                  f"shape={depth.shape}, "
-                  f"valid={valid_percent:.1f}%, "
-                  f"mean={mean_depth:.3f}, "
-                  f"range=[{np.min(depth):.3f}, {np.max(depth):.3f}], "
-                  f"time={capture_time*1000:.1f}ms")
-
             # Save images
             if args.save_images:
                 # Save normalized depth as grayscale
@@ -160,9 +156,6 @@ def test_camera_capture(args):
 
                 cv2.imwrite(str(gray_path), depth_vis)
                 cv2.imwrite(str(color_path), depth_colored)
-
-                if i == 0:
-                    print(f"\n  ✓ Saving images to {output_dir}/")
 
             # Display if requested
             if args.display:
@@ -179,6 +172,8 @@ def test_camera_capture(args):
 
             # Delay between captures
             time.sleep(args.delay)
+
+        print(" Done!")
 
         # Print summary
         print("\n" + "=" * 70)
