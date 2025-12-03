@@ -224,6 +224,8 @@ def main():
     # Test options
     parser.add_argument('--skip_basic_test', action='store_true',
                         help='Skip basic device enumeration test')
+    parser.add_argument('--warmup_time', type=int, default=3,
+                        help='Camera warmup time in seconds (default: 3)')
     parser.add_argument('--num_frames', type=int, default=10,
                         help='Number of frames to capture (default: 10)')
     parser.add_argument('--delay', type=float, default=0.1,
