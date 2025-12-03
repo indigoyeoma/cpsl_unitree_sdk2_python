@@ -13,9 +13,11 @@ class DeployConfig:
     control_dt = 0.02  # 50Hz policy (decimation=4 @ 200Hz sim)
     action_scale = 0.25
 
-    # PD gains (must match training config)
-    kp = 40.0  # stiffness
-    kd = 1.0   # damping
+    # PD gains (tuned for real hardware - lower than training for sim2real)
+    # Training used: kp=40.0, kd=1.0 (simulation)
+    # Real hardware needs lower gains to prevent excessive force/jumpiness
+    kp = 25.0  # stiffness (reduced from 40 for real hardware)
+    kd = 2.0   # damping (increased from 1 for smoother motion)
 
     # Default standing pose (from training config)
     default_joint_angles = np.array([
