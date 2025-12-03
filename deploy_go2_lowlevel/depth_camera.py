@@ -122,31 +122,46 @@ class D435iCamera:
         """
         Process raw depth frame to policy input format.
 
+        IMPORTANT: This MUST match training preprocessing exactly!
+        Training: crop → clip → resize → normalize to [-0.5, 0.5]
+
         Args:
             depth_frame: RealSense depth frame
 
         Returns:
-            Processed depth image (target_height x target_width), normalized 0-1
+            Processed depth image (target_height x target_width), normalized [-0.5, 0.5]
         """
         # Convert to numpy array (in millimeters for z16)
         depth_image = np.asanyarray(depth_frame.get_data()).astype(np.float32)
 
-        # Convert to meters
-        depth_image = depth_image * self.depth_scale
+        # Convert to meters (negative as in Isaac Gym depth)
+        depth_image = -depth_image * self.depth_scale
 
-        # Clip to valid range
-        depth_image = np.clip(depth_image, self.near_clip, self.far_clip)
+        # STEP 1: CROP edges (matching training: depth_image[:-2, 4:-4])
+        # Remove 4 pixels from left/right, 2 pixels from bottom
+        # From 424x240 → 416x238
+        depth_image = depth_image[:-2, 4:-4]
 
-        # Normalize to 0-1 (far=0, near=1 if inverted as in training)
-        # Training config has invert=True, so near is 1 and far is 0
-        depth_image = (self.far_clip - depth_image) / (self.far_clip - self.near_clip)
+        # STEP 2: Clip to valid range (negative values!)
+        depth_image = np.clip(depth_image, -self.far_clip, -self.near_clip)
 
-        # Resize to target dimensions
+        # STEP 3: Resize to target dimensions
+        # From 416x238 → 87x58
         depth_image = cv2.resize(
             depth_image,
             (self.target_width, self.target_height),
             interpolation=cv2.INTER_AREA
         )
+
+        # STEP 4: Normalize (matching training exactly)
+        # depth_image = depth_image * -1  (already negative)
+        # depth_image = (depth_image - near_clip) / (far_clip - near_clip) - 0.5
+        depth_image = depth_image * -1  # Make positive
+        depth_image = (depth_image - self.near_clip) / (self.far_clip - self.near_clip) - 0.5
+        # Result: range [-0.5, 0.5]
+        #   near (0m) → 0.5
+        #   mid (1m) → 0.0
+        #   far (2m) → -0.5
 
         return depth_image
 
