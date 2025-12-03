@@ -1,5 +1,5 @@
 """
-JIT Policy Loader for Go2 Vision Deployment
+JIT Policy Loader for Go2 Vision Deployment (STANDALONE - No Training Dependencies)
 
 Loads JIT traced models (vision_weight.pt + base_jit.pt) for deployment.
 """
@@ -7,15 +7,105 @@ Loads JIT traced models (vision_weight.pt + base_jit.pt) for deployment.
 import torch
 import torch.nn as nn
 import numpy as np
-import sys
 import os
 
-# Add rsl_rl to path for depth encoder architecture
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../cpsl_go2_rl_repo/rsl_rl'))
 
-from rsl_rl.modules.depth_backbone import DepthOnlyFCBackbone58x87, RecurrentDepthBackbone
-from rsl_rl.modules.actor_critic import get_activation
+# ============================================================================
+# Network Architectures (Standalone - no rsl_rl dependency)
+# ============================================================================
 
+class DepthOnlyFCBackbone58x87(nn.Module):
+    """
+    CNN for processing 58x87 depth images.
+    Standalone version - no external dependencies.
+    """
+    def __init__(self, scandots_output_dim=32, num_frames=1):
+        super().__init__()
+        self.num_frames = num_frames
+        activation = nn.ELU()
+
+        self.image_compression = nn.Sequential(
+            # Input: [batch, 1, 58, 87]
+            nn.Conv2d(in_channels=num_frames, out_channels=32, kernel_size=5),
+            # [batch, 32, 54, 83]
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # [batch, 32, 27, 41]
+            activation,
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3),
+            # [batch, 64, 25, 39]
+            activation,
+            nn.Flatten(),
+            # [batch, 64 * 25 * 39] = [batch, 62400]
+            nn.Linear(64 * 25 * 39, 128),
+            activation,
+            nn.Linear(128, scandots_output_dim)
+        )
+        self.output_activation = activation
+
+    def forward(self, images: torch.Tensor):
+        """
+        Args:
+            images: [batch, H, W] depth images
+        Returns:
+            [batch, scandots_output_dim] features
+        """
+        if images.dim() == 3:
+            images = images.unsqueeze(1)  # Add channel dim
+        images_compressed = self.image_compression(images)
+        latent = self.output_activation(images_compressed)
+        return latent
+
+
+class RecurrentDepthBackbone(nn.Module):
+    """
+    Combines depth CNN output with proprioception.
+    Standalone version - no recurrence (buffer_len=1).
+    """
+    def __init__(self, base_backbone, n_proprio=53):
+        super().__init__()
+        activation = nn.ELU()
+        last_activation = nn.Tanh()
+
+        self.base_backbone = base_backbone
+
+        # Combination MLP: depth_latent (32) + proprio (53) -> 32
+        self.combination_mlp = nn.Sequential(
+            nn.Linear(32 + n_proprio, 128),
+            activation,
+            nn.Linear(128, 32)
+        )
+
+        # Output MLP: 32 -> 34 (32 latent + 2 yaw)
+        self.output_mlp = nn.Sequential(
+            nn.Linear(32, 64),
+            activation,
+            nn.Linear(64, 34),  # 32 latent + 2 yaw
+            last_activation
+        )
+
+    def forward(self, depth_image, proprioception):
+        """
+        Args:
+            depth_image: [batch, H, W] depth image
+            proprioception: [batch, n_proprio] robot state
+        Returns:
+            [batch, 34] = [32 latent + 2 yaw]
+        """
+        # CNN: depth -> 32-dim
+        depth_latent = self.base_backbone(depth_image)
+
+        # Combine with proprio
+        combined = torch.cat([depth_latent, proprioception], dim=-1)
+        depth_latent = self.combination_mlp(combined)
+
+        # Output: latent + yaw prediction
+        output = self.output_mlp(depth_latent)
+        return output
+
+
+# ============================================================================
+# JIT Policy Runner
+# ============================================================================
 
 class JITPolicyRunner:
     """Runs inference using JIT traced vision policy."""
@@ -37,17 +127,17 @@ class JITPolicyRunner:
         self.depth_output_dim = 32
 
         # Load depth encoder
-        print(f"Loading depth encoder from: {vision_weight_path}")
+        print(f"Loading depth encoder from: {os.path.basename(vision_weight_path)}")
         self.depth_encoder = self._load_depth_encoder(vision_weight_path)
         self.depth_encoder.to(self.device)
         self.depth_encoder.eval()
 
         # Load JIT traced policy
-        print(f"Loading JIT policy from: {base_jit_path}")
+        print(f"Loading JIT policy from: {os.path.basename(base_jit_path)}")
         self.policy_jit = torch.jit.load(base_jit_path, map_location=self.device)
         self.policy_jit.eval()
 
-        print("Policy loaded successfully!")
+        print("✓ Policy loaded successfully")
 
     def _load_depth_encoder(self, vision_weight_path):
         """
@@ -62,24 +152,17 @@ class JITPolicyRunner:
         depth_encoder_state = checkpoint['depth_encoder_state_dict']
 
         # Build depth encoder architecture
-        activation = get_activation('elu')
-
         # CNN backbone
         base_backbone = DepthOnlyFCBackbone58x87(
-            prop_dim=self.n_proprio,
             scandots_output_dim=32,
-            hidden_state_dim=512,
-            output_activation=None,
             num_frames=1
         )
 
         # Full depth encoder with MLP
-        class DummyConfig:
-            class env:
-                n_proprio = 53
-
-        env_cfg = DummyConfig()
-        depth_encoder = RecurrentDepthBackbone(base_backbone, env_cfg)
+        depth_encoder = RecurrentDepthBackbone(
+            base_backbone=base_backbone,
+            n_proprio=self.n_proprio
+        )
 
         # Load weights
         depth_encoder.load_state_dict(depth_encoder_state, strict=True)
@@ -92,7 +175,7 @@ class JITPolicyRunner:
         Run policy inference.
 
         Args:
-            depth_image: Depth image (H x W), normalized 0-1
+            depth_image: Depth image (H x W), normalized [-0.5, 0.5]
             obs: Full observation vector (proprio + scan + priv + history)
 
         Returns:
