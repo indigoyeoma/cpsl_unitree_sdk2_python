@@ -16,8 +16,9 @@ class DeployConfig:
     # PD gains (tuned for real hardware - lower than training for sim2real)
     # Training used: kp=40.0, kd=1.0 (simulation)
     # Real hardware needs lower gains to prevent excessive force/jumpiness
-    kp = 25.0  # stiffness (reduced from 40 for real hardware)
-    kd = 2.0   # damping (increased from 1 for smoother motion)
+    # Tested values from working rough_go2 deployment
+    kp = 30.0  # stiffness (reduced from 40 for real hardware)
+    kd = 0.6   # damping (low damping for responsive control)
 
     # Default standing pose (from training config)
     default_joint_angles = np.array([
@@ -77,6 +78,12 @@ class DeployConfig:
 
     # Command velocity (for forward walking)
     command_vx = 0.5  # Forward velocity command (m/s), range: 0.0 - 1.0
+
+    # Goal-based navigation (matching training)
+    goal_distance = 1.0  # Distance to place goal ahead (meters)
+    goal_update_threshold = 0.3  # Update goal when within this distance (meters)
+    next_goal_distance = 2.0  # Distance for next waypoint
+    lin_vel_scale = 2.0  # Observation scale for linear velocity/commands
 
     # Model paths (relative to this file, update as needed)
     model_path = ""  # Set this when running

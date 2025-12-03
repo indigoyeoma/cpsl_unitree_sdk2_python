@@ -68,6 +68,14 @@ class Go2VisionController:
         self.action_history = deque(maxlen=2)
         self.last_action = np.zeros(12, dtype=np.float32)
 
+        # Goal-based navigation (matching training)
+        self.current_goal = np.array([config.goal_distance, 0.0], dtype=np.float32)  # [x, y] in world frame
+        self.next_goal = np.array([config.next_goal_distance, 0.0], dtype=np.float32)
+        self.robot_position = np.zeros(2, dtype=np.float32)  # [x, y] in world frame
+        self.robot_yaw = 0.0  # Current heading in radians
+        self.delta_yaw = 0.0  # Yaw error to current goal
+        self.delta_next_yaw = 0.0  # Yaw error to next goal
+
         # Phase control (matching go2_stand_example.py pattern)
         self.phase = 0  # 0=sit→stand, 1=hold, 2=walk, 3=stand→sit
         self.dt = 0.002  # 500Hz control
@@ -384,8 +392,51 @@ class Go2VisionController:
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.lowcmd_publisher.Write(self.low_cmd)
 
+    def _update_goals_and_yaw(self):
+        """Update goals and compute delta_yaw for straight-line walking."""
+        # Get current robot yaw from IMU
+        imu = self.low_state.imu_state
+        quat = imu.quaternion  # [w, x, y, z]
+
+        # Compute yaw from quaternion (heading angle)
+        # yaw = atan2(2*(w*z + x*y), 1 - 2*(y^2 + z^2))
+        self.robot_yaw = np.arctan2(
+            2 * (quat[0] * quat[3] + quat[1] * quat[2]),
+            1 - 2 * (quat[2]**2 + quat[3]**2)
+        )
+
+        # Keep goal constantly ahead in current heading direction
+        # This makes the robot walk straight forward
+        forward_dir = np.array([np.cos(self.robot_yaw), np.sin(self.robot_yaw)])
+        self.current_goal = self.robot_position + forward_dir * self.config.goal_distance
+        self.next_goal = self.robot_position + forward_dir * self.config.next_goal_distance
+
+        # Compute target yaw (direction to goal)
+        target_pos_rel = self.current_goal - self.robot_position
+        next_target_pos_rel = self.next_goal - self.robot_position
+
+        norm = np.linalg.norm(target_pos_rel) + 1e-5
+        target_vec_norm = target_pos_rel / norm
+        target_yaw = np.arctan2(target_vec_norm[1], target_vec_norm[0])
+
+        norm_next = np.linalg.norm(next_target_pos_rel) + 1e-5
+        next_target_vec_norm = next_target_pos_rel / norm_next
+        next_target_yaw = np.arctan2(next_target_vec_norm[1], next_target_vec_norm[0])
+
+        # Compute delta yaw (yaw error to goal)
+        # Since goal is always ahead in current heading, delta_yaw should be ~0 for straight walking
+        self.delta_yaw = target_yaw - self.robot_yaw
+        self.delta_next_yaw = next_target_yaw - self.robot_yaw
+
+        # Wrap angles to [-pi, pi]
+        self.delta_yaw = np.arctan2(np.sin(self.delta_yaw), np.cos(self.delta_yaw))
+        self.delta_next_yaw = np.arctan2(np.sin(self.delta_next_yaw), np.cos(self.delta_next_yaw))
+
     def _build_observation(self) -> np.ndarray:
         """Build observation vector from real sensors."""
+        # Update goals and compute delta_yaw (matching training)
+        self._update_goals_and_yaw()
+
         # Get IMU data
         imu = self.low_state.imu_state
         roll = np.arctan2(
@@ -427,10 +478,10 @@ class Go2VisionController:
             ang_vel * ang_vel_scale,       # 3
             [roll, pitch],                  # 2
             [0.0],                          # delta_yaw (masked)
-            [0.0],                          # delta_yaw
-            [0.0],                          # delta_next_yaw
+            [self.delta_yaw],               # delta_yaw (yaw error to goal) ← FIXED!
+            [self.delta_next_yaw],          # delta_next_yaw ← FIXED!
             [0.0, 0.0],                     # commands (masked)
-            [self.config.command_vx],       # command_vx (GOAL)
+            [self.config.command_vx * self.config.lin_vel_scale],  # command_vx scaled ← FIXED!
             [1.0, 0.0],                     # env_class flags
             dof_pos * dof_pos_scale,        # 12
             joint_vel_train * dof_vel_scale, # 12
