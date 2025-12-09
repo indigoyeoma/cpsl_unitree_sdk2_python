@@ -13,12 +13,11 @@ class DeployConfig:
     control_dt = 0.02  # 50Hz policy (decimation=4 @ 200Hz sim)
     action_scale = 0.25
 
-    # PD gains (tuned for real hardware - lower than training for sim2real)
-    # Training used: kp=40.0, kd=1.0 (simulation)
-    # Real hardware needs lower gains to prevent excessive force/jumpiness
-    # Tested values from working rough_go2 deployment
-    kp = 30.0  # stiffness (reduced from 40 for real hardware)
-    kd = 0.6   # damping (low damping for responsive control)
+    # PD gains (must match or be lower than training for sim2real safety)
+    # Training used: kp=25.0, kd=0.6 (from go2_config.py)
+    # Real hardware: use same or slightly lower for safety
+    kp = 25.0  # stiffness (matches training)
+    kd = 0.6   # damping (matches training)
 
     # Default standing pose (from training config)
     default_joint_angles = np.array([
@@ -61,12 +60,13 @@ class DeployConfig:
     # Training output (action): [FL_hip, FL_thigh, FL_calf, FR_*, RL_*, RR_*]
     # SDK expects: [FR_*, FL_*, RR_*, RL_*]
 
-    # Depth camera config (D435i on Go2 head)
+    # Depth camera config (D435i on Go2 head - must match training)
+    # From go2_config.py: resized=(87,58), fov=87, near=0.3, far=3.0
     depth_width = 87
     depth_height = 58
-    depth_fov = 86  # horizontal FOV in degrees
-    depth_near = 0.0
-    depth_far = 2.0
+    depth_fov = 87  # horizontal FOV in degrees (matches training)
+    depth_near = 0.3  # D435i minimum depth (matches training)
+    depth_far = 3.0   # D435i maximum depth (matches training)
     depth_scale = 1.0
 
     # Observation dimensions (must match training)

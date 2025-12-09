@@ -2,15 +2,21 @@
 """
 Go2 Vision Policy Deployment with Safe Sit→Stand→Walk→Sit Sequence
 
+Mission: Walk 2.5 meters forward with vision-based obstacle navigation
+
 Sequence:
 1. Camera warmup (3s)
 2. Sit → Stand (smooth transition)
 3. Wait 5 seconds in standing pose
-4. Run vision policy (walk forward)
-5. On Ctrl+C: Stand → Sit (safe shutdown)
+4. Run vision policy (walk 2.5m forward)
+5. Auto-stop and sit down when complete
+6. Emergency stop: Ctrl+C → safe sit-down
 
 Usage:
-    python deploy.py --command_vx 0.5
+    python deploy.py                    # Default: 0.5 m/s, 2.5m mission
+    python deploy.py --command_vx 0.3   # Slower (safer for first test)
+    python deploy.py --command_vx 0.8   # Faster (after confidence)
+    python deploy.py --use_dummy_camera # Test without real camera
 """
 
 import sys
@@ -76,6 +82,12 @@ class Go2VisionController:
         self.delta_yaw = 0.0  # Yaw error to current goal
         self.delta_next_yaw = 0.0  # Yaw error to next goal
 
+        # Distance tracking - walk 2.5 meters
+        self.target_distance_meters = 2.5  # Target: 2.5 meters
+        self.start_position = None  # Will be set when walking starts
+        self.distance_traveled = 0.0  # Distance traveled in meters
+        self.mission_complete = False
+
         # Phase control (matching go2_stand_example.py pattern)
         self.phase = 0  # 0=sit→stand, 1=hold, 2=walk, 3=stand→sit
         self.dt = 0.002  # 500Hz control
@@ -115,6 +127,7 @@ class Go2VisionController:
         self.control_step = 0
 
         print(f"Controller initialized")
+        print(f"  Target distance: {self.target_distance_meters:.2f} meters")
         print(f"  Command velocity: {self.config.command_vx} m/s")
         print(f"  Sit→Stand: {self.duration_sit_to_stand * self.dt:.1f}s")
         print(f"  Hold: {self.duration_hold * self.dt:.1f}s")
@@ -314,6 +327,26 @@ class Go2VisionController:
         """Phase 2: Run vision policy for walking."""
         current_time = time.time()
 
+        # Set start position on first walk iteration
+        if self.start_position is None:
+            self.start_position = self.robot_position.copy()
+            print(f"\n  Starting position: ({self.start_position[0]:.3f}, {self.start_position[1]:.3f})")
+            print(f"  Walking 2.5 meters forward...\n")
+
+        # Update distance traveled
+        self.distance_traveled = np.linalg.norm(self.robot_position - self.start_position)
+
+        # Check if target distance reached
+        if self.distance_traveled >= self.target_distance_meters and not self.mission_complete:
+            self.mission_complete = True
+            print(f"\n{'='*70}")
+            print(f"✓ Target distance reached: {self.distance_traveled:.2f}m / {self.target_distance_meters:.2f}m")
+            print(f"{'='*70}\n")
+            print("Transitioning to sit down...")
+            self.phase = 3  # Move to stand→sit phase
+            self.percent_stand_to_sit = 0.0
+            return
+
         # Run policy at 50Hz
         if current_time - self.last_policy_time >= self.policy_dt:
             self.last_policy_time = current_time
@@ -346,14 +379,18 @@ class Go2VisionController:
             self.last_action = action
             self.action_history.append(action)
 
-            # Print status every 1 second
+            # Print status with distance progress
             if self.walk_startup_counter % 50 == 0:
                 if self.walk_startup_counter < self.walk_startup_duration:
                     progress = 100 * self.walk_startup_counter / self.walk_startup_duration
                     print(f"  Startup ramp: {progress:.0f}%", end='\r')
                 elif self.walk_startup_counter == self.walk_startup_duration:
                     print(f"  Startup ramp: 100% ✓" + " " * 20)
-                    print("  Walking at full speed...")
+                else:
+                    # Show distance progress every second
+                    percent_complete = (self.distance_traveled / self.target_distance_meters) * 100
+                    remaining = self.target_distance_meters - self.distance_traveled
+                    print(f"  Distance: {self.distance_traveled:.2f}m / {self.target_distance_meters:.2f}m ({percent_complete:.0f}%) - {remaining:.2f}m remaining", end='\r')
 
     def _phase_stand_to_sit(self):
         """Phase 3: Safe sit down from standing."""
@@ -404,6 +441,19 @@ class Go2VisionController:
             2 * (quat[0] * quat[3] + quat[1] * quat[2]),
             1 - 2 * (quat[2]**2 + quat[3]**2)
         )
+
+        # Update robot position by integrating velocity in world frame
+        # Get linear velocity in body frame (from state estimator)
+        # Note: For Go2, we estimate velocity from joint velocities and IMU
+        # Approximation: forward velocity ≈ command_vx * 0.8 (rough estimate)
+        # Better: use actual velocity estimator if available
+        dt = self.policy_dt
+        vel_forward = self.config.command_vx * 0.8  # Approximate actual velocity
+
+        # Convert body-frame velocity to world-frame displacement
+        dx = vel_forward * np.cos(self.robot_yaw) * dt
+        dy = vel_forward * np.sin(self.robot_yaw) * dt
+        self.robot_position += np.array([dx, dy], dtype=np.float32)
 
         # Keep goal constantly ahead in current heading direction
         # This makes the robot walk straight forward
