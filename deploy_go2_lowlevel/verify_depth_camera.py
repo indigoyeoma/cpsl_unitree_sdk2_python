@@ -139,10 +139,16 @@ class DepthVerifier:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(raw_vis, "Ground should be: BOTTOM HALF", (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        cv2.putText(raw_vis, "Close objects: BRIGHT", (10, 85),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        cv2.putText(raw_vis, "Far objects: DARK", (10, 110),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # COLOR LEGEND - CRITICAL!
+        cv2.putText(raw_vis, "COLOR LEGEND:", (10, 90),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+        cv2.putText(raw_vis, "RED/YELLOW = CLOSE (0.3-1m)", (10, 115),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        cv2.putText(raw_vis, "GREEN = MID (~1.5m)", (10, 140),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        cv2.putText(raw_vis, "BLUE = FAR (2-3m)", (10, 165),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
         # PROCESSED VIEW (87x58 - scaled up for visibility)
         proc_vis = self.depth_to_color(depth_normalized, -0.5, 0.5)
@@ -179,26 +185,48 @@ class DepthVerifier:
             cv2.putText(combined, check, (10, checklist_y + 30 + i*25),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # Add stats
+        # Add stats - IMPORTANT DEBUG INFO
         stats_y = 10
+
+        # Find a central pixel to sample
+        center_y, center_x = depth_raw.shape[0]//2, depth_raw.shape[1]//2
+        center_depth = -depth_raw[center_y, center_x]  # Make positive for display
+
         stats = [
-            f"Min depth: {-depth_raw.max():.2f}m",
-            f"Max depth: {-depth_raw.min():.2f}m",
-            f"Mean depth: {-depth_raw.mean():.2f}m",
+            f"Raw depth range:",
+            f"  Min: {-depth_raw.max():.2f}m (closest)",
+            f"  Max: {-depth_raw.min():.2f}m (farthest)",
+            f"  Mean: {-depth_raw.mean():.2f}m",
+            f"  Center pixel: {center_depth:.2f}m",
+            "",
+            f"Normalized range:",
+            f"  Min: {depth_normalized.min():.3f}",
+            f"  Max: {depth_normalized.max():.3f}",
         ]
         for i, stat in enumerate(stats):
-            cv2.putText(combined, stat, (450, stats_y + 20 + i*20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(combined, stat, (10, 400 + i*18),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
         return combined
 
     def depth_to_color(self, depth, vmin, vmax):
-        """Convert depth to color visualization."""
+        """
+        Convert depth to color visualization.
+
+        COLORMAP_JET mapping:
+        - 0 (dark blue) = far
+        - 255 (red/yellow) = close
+
+        For negative depth values (Isaac Gym convention):
+        - vmin = -3.0 (far) should map to 0 (blue)
+        - vmax = -0.3 (close) should map to 255 (red)
+        """
         # Normalize to 0-255
+        # Invert the mapping so close (larger negative values) = bright
         depth_norm = ((depth - vmin) / (vmax - vmin) * 255).astype(np.uint8)
         depth_norm = np.clip(depth_norm, 0, 255)
 
-        # Apply colormap
+        # Apply colormap (JET: 0=blue/far, 255=red/close)
         depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_JET)
 
         return depth_color
