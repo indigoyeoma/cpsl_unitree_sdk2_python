@@ -90,10 +90,10 @@ class DepthVerifier:
         print(f"✓ Camera started")
         print(f"  Depth scale: {self.depth_scale}")
 
-        # Set high accuracy preset
+        # Set medium density preset
         try:
-            depth_sensor.set_option(rs.option.visual_preset, 3)
-            print(f"✓ High accuracy mode enabled")
+            depth_sensor.set_option(rs.option.visual_preset, 5)  # Medium Density
+            print(f"✓ Medium Density mode enabled (balanced quality & speed)")
         except Exception as e:
             print(f"⚠ Could not set visual preset: {e}")
 
@@ -118,9 +118,11 @@ class DepthVerifier:
             interpolation=cv2.INTER_AREA
         )
 
-        # Normalize to [-0.5, 0.5]
+        # Normalize to [-0.5, 0.5] with INVERSION (matching training)
+        # Training has invert=True: close → HIGH, far → LOW
         depth_normalized = depth_resized * -1  # Make positive
-        depth_normalized = (depth_normalized - self.near_clip) / (self.far_clip - self.near_clip) - 0.5
+        depth_normalized = 0.5 - (depth_normalized - self.near_clip) / (self.far_clip - self.near_clip)
+        # Result: close (0.3m) → +0.5, far (3.0m) → -0.5
 
         return depth_image, depth_cropped, depth_clipped, depth_resized, depth_normalized
 

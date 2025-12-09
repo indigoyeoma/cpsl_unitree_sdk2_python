@@ -88,9 +88,10 @@ class D435iCamera:
         depth_sensor = profile.get_device().first_depth_sensor()
         self.depth_scale = depth_sensor.get_depth_scale()
 
-        # Set high accuracy preset for better depth quality
+        # Set medium density preset for balanced performance
         try:
-            depth_sensor.set_option(rs.option.visual_preset, 3)  # High Accuracy
+            depth_sensor.set_option(rs.option.visual_preset, 5)  # Medium Density
+            print(f"✓ Medium Density mode enabled (balanced quality & speed)")
         except Exception as e:
             print(f"Could not set visual preset: {e}")
 
@@ -154,14 +155,19 @@ class D435iCamera:
         )
 
         # STEP 4: Normalize (matching training exactly)
-        # depth_image = depth_image * -1  (already negative)
-        # depth_image = (depth_image - near_clip) / (far_clip - near_clip) - 0.5
-        depth_image = depth_image * -1  # Make positive
-        depth_image = (depth_image - self.near_clip) / (self.far_clip - self.near_clip) - 0.5
+        # Training has invert=True, meaning close objects → HIGH values
+        # We need: close (0.3m) → +0.5, far (3.0m) → -0.5
+        depth_image = depth_image * -1  # Make positive (0.3m to 3.0m range)
+
+        # Invert the normalization: close → high, far → low
+        # Standard: (depth - near) / (far - near) gives close→0, far→1
+        # Inverted: we want close→1, far→0, then shift to [-0.5, 0.5]
+        depth_image = 0.5 - (depth_image - self.near_clip) / (self.far_clip - self.near_clip)
+
         # Result: range [-0.5, 0.5]
-        #   near (0m) → 0.5
-        #   mid (1m) → 0.0
-        #   far (2m) → -0.5
+        #   near (0.3m) → 0.5 - 0 = +0.5  (CLOSE = HIGH)
+        #   mid (1.65m) → 0.5 - 0.5 = 0.0
+        #   far (3.0m) → 0.5 - 1.0 = -0.5  (FAR = LOW)
 
         return depth_image
 
