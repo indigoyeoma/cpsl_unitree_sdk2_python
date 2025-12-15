@@ -131,7 +131,6 @@ class Go2VisionController:
         print(f"  Command velocity: {self.config.command_vx} m/s")
         print(f"  Sit→Stand: {self.duration_sit_to_stand * self.dt:.1f}s")
         print(f"  Hold: {self.duration_hold * self.dt:.1f}s")
-        print(f"  Walk startup ramp: {self.walk_startup_duration * self.policy_dt:.1f}s")
         print(f"  Stand→Sit: {self.duration_stand_to_sit * self.dt:.1f}s")
 
     def init(self):
@@ -365,13 +364,6 @@ class Go2VisionController:
             # Apply joint limits
             target_pos_train = JointLimits.clip_joints(target_pos_train)
 
-            # Smooth startup ramp (10 seconds)
-            if self.walk_startup_counter < self.walk_startup_duration:
-                alpha = self.walk_startup_counter / self.walk_startup_duration
-                target_pos_train = (1 - alpha) * self.config.default_joint_angles + \
-                                 alpha * target_pos_train
-                self.walk_startup_counter += 1
-
             # Convert to SDK order
             self.target_positions = self._training_to_sdk_order(target_pos_train)
 
@@ -380,17 +372,12 @@ class Go2VisionController:
             self.action_history.append(action)
 
             # Print status with distance progress
+            self.walk_startup_counter += 1
             if self.walk_startup_counter % 50 == 0:
-                if self.walk_startup_counter < self.walk_startup_duration:
-                    progress = 100 * self.walk_startup_counter / self.walk_startup_duration
-                    print(f"  Startup ramp: {progress:.0f}%", end='\r')
-                elif self.walk_startup_counter == self.walk_startup_duration:
-                    print(f"  Startup ramp: 100% ✓" + " " * 20)
-                else:
-                    # Show distance progress every second
-                    percent_complete = (self.distance_traveled / self.target_distance_meters) * 100
-                    remaining = self.target_distance_meters - self.distance_traveled
-                    print(f"  Distance: {self.distance_traveled:.2f}m / {self.target_distance_meters:.2f}m ({percent_complete:.0f}%) - {remaining:.2f}m remaining", end='\r')
+                # Show distance progress every second
+                percent_complete = (self.distance_traveled / self.target_distance_meters) * 100
+                remaining = self.target_distance_meters - self.distance_traveled
+                print(f"  Distance: {self.distance_traveled:.2f}m / {self.target_distance_meters:.2f}m ({percent_complete:.0f}%) - {remaining:.2f}m remaining", end='\r')
 
     def _phase_stand_to_sit(self):
         """Phase 3: Safe sit down from standing."""
@@ -419,11 +406,21 @@ class Go2VisionController:
         if not hasattr(self, 'target_positions'):
             return
 
+        # Use different PD gains for standing vs walking
+        # Phase 0: sit→stand, Phase 1: hold, Phase 3: stand→sit → use standing gains
+        # Phase 2: walk → use walking gains (matches training)
+        if self.phase == 2:  # Walking
+            kp = self.config.kp_walk
+            kd = self.config.kd_walk
+        else:  # Standing/transitions
+            kp = self.config.kp_stand
+            kd = self.config.kd_stand
+
         for i in range(12):
             self.low_cmd.motor_cmd[i].q = float(self.target_positions[i])
             self.low_cmd.motor_cmd[i].dq = 0
-            self.low_cmd.motor_cmd[i].kp = self.config.kp
-            self.low_cmd.motor_cmd[i].kd = self.config.kd
+            self.low_cmd.motor_cmd[i].kp = kp
+            self.low_cmd.motor_cmd[i].kd = kd
             self.low_cmd.motor_cmd[i].tau = 0
 
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)

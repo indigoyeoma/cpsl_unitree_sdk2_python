@@ -13,11 +13,19 @@ class DeployConfig:
     control_dt = 0.02  # 50Hz policy (decimation=4 @ 200Hz sim)
     action_scale = 0.25
 
-    # PD gains (must match or be lower than training for sim2real safety)
+    # PD gains for WALKING (must match training for sim2real)
     # Training used: kp=25.0, kd=0.6 (from go2_config.py)
-    # Real hardware: use same or slightly lower for safety
-    kp = 25.0  # stiffness (matches training)
-    kd = 0.6   # damping (matches training)
+    kp_walk = 25.0  # stiffness for walking (matches training)
+    kd_walk = 0.6   # damping for walking (matches training)
+
+    # PD gains for STANDING (higher for stability)
+    # From Unitree SDK examples - stiffer for holding position
+    kp_stand = 70.0  # stiffness for standing
+    kd_stand = 3.0   # damping for standing
+
+    # Default (will be switched based on phase)
+    kp = 70.0
+    kd = 3.0
 
     # Default standing pose (from training config)
     default_joint_angles = np.array([
