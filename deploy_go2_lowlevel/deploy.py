@@ -51,17 +51,19 @@ class Go2VisionController:
     Go2 controller with safe sit→stand→walk→sit sequence.
 
     Phases:
-    - Phase 1 (sit→stand): Smooth transition from sitting to standing
-    - Phase 2 (hold): Hold standing position for 5 seconds
-    - Phase 3 (walk): Run vision policy
-    - Phase 4 (stand→sit): Safe sit down on shutdown
+    - Phase 0 (sit→stand): Smooth transition from sitting to standing (can be skipped)
+    - Phase 1 (hold): Hold standing position for 5 seconds
+    - Phase 2 (walk): Run vision policy
+    - Phase 3 (stand→sit): Safe sit down on shutdown
     """
 
-    def __init__(self, policy: JITPolicyRunner, camera, config: DeployConfig):
+    def __init__(self, policy: JITPolicyRunner, camera, config: DeployConfig,
+                 skip_standup: bool = False):
         self.policy = policy
         self.camera = camera
         self.config = config
         self.crc = CRC()
+        self.skip_standup = skip_standup
 
         # Control state
         self.low_cmd = unitree_go_msg_dds__LowCmd_()
@@ -129,7 +131,10 @@ class Go2VisionController:
         print(f"Controller initialized")
         print(f"  Target distance: {self.target_distance_meters:.2f} meters")
         print(f"  Command velocity: {self.config.command_vx} m/s")
-        print(f"  Sit→Stand: {self.duration_sit_to_stand * self.dt:.1f}s")
+        if skip_standup:
+            print(f"  Mode: Skip standup (start in standing pose like simulator)")
+        else:
+            print(f"  Sit→Stand: {self.duration_sit_to_stand * self.dt:.1f}s")
         print(f"  Hold: {self.duration_hold * self.dt:.1f}s")
         print(f"  Stand→Sit: {self.duration_stand_to_sit * self.dt:.1f}s")
 
@@ -194,7 +199,15 @@ class Go2VisionController:
     def start(self):
         """Start the control loop."""
         self.running = True
-        self.phase = 0  # Start with sit→stand
+
+        # Start phase depends on skip_standup flag
+        if self.skip_standup:
+            self.phase = 1  # Skip sit→stand, start with hold
+            self.start_pos = self._stand_pos.copy()  # Start from standing pose
+            self.first_run = False  # Don't capture start position
+            print("\n✓ Starting in standing pose (like simulator)")
+        else:
+            self.phase = 0  # Start with sit→stand
 
         # Start camera
         print("\n" + "=" * 70)
@@ -615,6 +628,8 @@ def main():
                         help='Use dummy camera for testing')
     parser.add_argument('--network_interface', type=str, default=None,
                         help='Network interface for DDS')
+    parser.add_argument('--skip_standup', action='store_true',
+                        help='Skip sit-to-stand transition, start in standing pose (like simulator)')
     args = parser.parse_args()
 
     # Find models
@@ -642,7 +657,10 @@ def main():
         print("\n⚠️  SAFETY WARNING")
         print("  - Clear 3-5 meters in front of robot")
         print("  - Press Ctrl+C anytime for safe shutdown")
-        print("  - Robot will: Sit→Stand→Walk→Sit")
+        if args.skip_standup:
+            print("  - Robot will: Stand→Hold→Walk→Sit (skipping sit-to-stand)")
+        else:
+            print("  - Robot will: Sit→Stand→Walk→Sit")
         response = input("\nReady? (yes/no): ")
         if response.lower() not in ['yes', 'y']:
             return 0
@@ -672,7 +690,7 @@ def main():
     config.command_vx = args.command_vx
 
     # Create controller
-    controller = Go2VisionController(policy, camera, config)
+    controller = Go2VisionController(policy, camera, config, skip_standup=args.skip_standup)
 
     # Setup signal handler for safe shutdown
     def signal_handler(sig, frame):
