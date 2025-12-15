@@ -370,6 +370,9 @@ class Go2VisionController:
             # Run policy inference
             action = self.policy.get_action(depth_image, obs)
 
+            # Clip actions (must match training: clip_actions = 1.2)
+            action = np.clip(action, -self.config.clip_actions, self.config.clip_actions)
+
             # Scale action and add to default pose (in training order)
             target_delta = action * self.config.action_scale
             target_pos_train = self.config.default_joint_angles + target_delta
@@ -540,7 +543,7 @@ class Go2VisionController:
             [self.delta_yaw],               # delta_yaw (yaw error to goal) ← FIXED!
             [self.delta_next_yaw],          # delta_next_yaw ← FIXED!
             [0.0, 0.0],                     # commands (masked)
-            [self.config.command_vx * self.config.lin_vel_scale],  # command_vx scaled ← FIXED!
+            [self.config.command_vx],  # command_vx RAW (no scaling - matches training!)
             [1.0, 0.0],                     # env_class flags
             dof_pos * dof_pos_scale,        # 12
             joint_vel_train * dof_vel_scale, # 12
@@ -619,8 +622,8 @@ def main():
     parser.add_argument('--policy_dir', type=str,
                         default=os.path.join(os.path.dirname(__file__), 'policy'),
                         help='Directory containing policy files')
-    parser.add_argument('--command_vx', type=float, default=0.5,
-                        help='Forward velocity goal in m/s (default: 0.5)')
+    parser.add_argument('--command_vx', type=float, default=0.3,
+                        help='Forward velocity goal in m/s (default: 0.3)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device for inference (cuda/cpu)')
     parser.add_argument('--use_dummy_camera', action='store_true',

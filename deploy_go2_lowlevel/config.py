@@ -12,6 +12,7 @@ class DeployConfig:
     # Control parameters (must match training config)
     control_dt = 0.02  # 50Hz policy (decimation=4 @ 200Hz sim)
     action_scale = 0.25
+    clip_actions = 1.2  # Action clipping (must match training)
 
     # PD gains for WALKING (must match training for sim2real)
     # Training used: kp=25.0, kd=0.6 (from go2_config.py)
@@ -85,7 +86,7 @@ class DeployConfig:
     n_priv_latent = 29   # 4 + 1 + 12 + 12 (mass, friction, motor_strength)
 
     # Command velocity (for forward walking)
-    command_vx = 0.5  # Forward velocity command (m/s), range: 0.0 - 1.0
+    command_vx = 0.3  # Forward velocity command (m/s), range: 0.0 - 1.0
 
     # Goal-based navigation (matching training)
     goal_distance = 1.0  # Distance to place goal ahead (meters)
