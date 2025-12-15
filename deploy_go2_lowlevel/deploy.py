@@ -419,15 +419,14 @@ class Go2VisionController:
         if not hasattr(self, 'target_positions'):
             return
 
-        # Use different PD gains for standing vs walking
-        # Phase 0: sit→stand, Phase 1: hold, Phase 3: stand→sit → use standing gains
-        # Phase 2: walk → use walking gains (matches training)
-        if self.phase == 2:  # Walking
-            kp = self.config.kp_walk
-            kd = self.config.kd_walk
-        else:  # Standing/transitions
-            kp = self.config.kp_stand
-            kd = self.config.kd_stand
+        # Use higher gains for sit↔stand transitions (need torque to lift/lower)
+        # Use training gains for hold and walk (no sudden sag between them)
+        if self.phase == 0 or self.phase == 3:  # sit→stand or stand→sit
+            kp = self.config.kp_stand  # 70.0 (strong for transitions)
+            kd = self.config.kd_stand  # 3.0
+        else:  # hold (phase 1) and walk (phase 2)
+            kp = self.config.kp_walk   # 25.0 (training gains)
+            kd = self.config.kd_walk   # 0.6
 
         for i in range(12):
             self.low_cmd.motor_cmd[i].q = float(self.target_positions[i])
