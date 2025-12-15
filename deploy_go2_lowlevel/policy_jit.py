@@ -56,10 +56,13 @@ class DepthOnlyFCBackbone58x87(nn.Module):
         return latent
 
 
-class RecurrentDepthBackbone(nn.Module):
+class SimpleDepthEncoder(nn.Module):
     """
-    Combines depth CNN output with proprioception.
-    Standalone version - no recurrence (buffer_len=1).
+    Simple feedforward depth encoder (no RNN/temporal processing).
+    Matches training SimpleDepthEncoder architecture exactly.
+
+    Flow: depth → CNN → [32] → cat proprio [53] → MLP → [32] → output_mlp → [34]
+    Output: [32] depth_latent + [2] yaw prediction
     """
     def __init__(self, base_backbone, n_proprio=53):
         super().__init__()
@@ -75,11 +78,10 @@ class RecurrentDepthBackbone(nn.Module):
             nn.Linear(128, 32)
         )
 
-        # Output MLP: 32 -> 34 (32 latent + 2 yaw)
+        # Output MLP: 32 -> 34 (32 depth_latent + 2 yaw)
+        # This matches training SimpleDepthEncoder exactly
         self.output_mlp = nn.Sequential(
-            nn.Linear(32, 64),
-            activation,
-            nn.Linear(64, 34),  # 32 latent + 2 yaw
+            nn.Linear(32, 32 + 2),
             last_activation
         )
 
@@ -89,7 +91,7 @@ class RecurrentDepthBackbone(nn.Module):
             depth_image: [batch, H, W] depth image
             proprioception: [batch, n_proprio] robot state
         Returns:
-            [batch, 34] = [32 latent + 2 yaw]
+            [batch, 34] = [32] depth_latent + [2] yaw prediction
         """
         # CNN: depth -> 32-dim
         depth_latent = self.base_backbone(depth_image)
@@ -98,9 +100,10 @@ class RecurrentDepthBackbone(nn.Module):
         combined = torch.cat([depth_latent, proprioception], dim=-1)
         depth_latent = self.combination_mlp(combined)
 
-        # Output: latent + yaw prediction
-        output = self.output_mlp(depth_latent)
-        return output
+        # Output layer (matches training)
+        depth_latent = self.output_mlp(depth_latent)
+
+        return depth_latent
 
 
 # ============================================================================
@@ -145,7 +148,7 @@ class JITPolicyRunner:
 
         The depth encoder consists of:
         - DepthOnlyFCBackbone58x87: CNN (58x87 depth -> 32-dim)
-        - RecurrentDepthBackbone: MLP (32 + 53 proprio -> 34 output)
+        - SimpleDepthEncoder: Simple MLP (32 + 53 proprio -> 32 output)
         """
         # Load state dict
         checkpoint = torch.load(vision_weight_path, map_location=self.device)
@@ -158,8 +161,8 @@ class JITPolicyRunner:
             num_frames=1
         )
 
-        # Full depth encoder with MLP
-        depth_encoder = RecurrentDepthBackbone(
+        # Full depth encoder with MLP (simple feedforward, no RNN)
+        depth_encoder = SimpleDepthEncoder(
             base_backbone=base_backbone,
             n_proprio=self.n_proprio
         )
@@ -187,15 +190,17 @@ class JITPolicyRunner:
 
         # Get proprioception for depth encoder (first n_proprio elements)
         proprio = obs_tensor[:, :self.n_proprio].clone()
-        proprio[:, 6:8] = 0  # Mask yaw as in training
+        proprio[:, 6:8] = 0  # Mask yaw for depth encoder input
 
-        # Run depth encoder to get depth latent + yaw
+        # Run depth encoder to get [34] = [32] depth_latent + [2] yaw
         depth_latent_and_yaw = self.depth_encoder(depth_tensor, proprio)
-        depth_latent = depth_latent_and_yaw[:, :-2]
-        yaw_pred = depth_latent_and_yaw[:, -2:]
 
-        # Update observation with predicted yaw
-        obs_tensor[:, 6:8] = 1.5 * yaw_pred
+        # Split depth latent and yaw prediction
+        depth_latent = depth_latent_and_yaw[:, :-2]  # [32]
+        yaw = depth_latent_and_yaw[:, -2:]           # [2]
+
+        # Update observation with predicted yaw (scaled by 1.5 as in training)
+        obs_tensor[:, 6:8] = 1.5 * yaw
 
         # Run JIT policy (estimator + actor)
         # The JIT policy expects (obs, depth_latent)
