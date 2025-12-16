@@ -204,7 +204,12 @@ class JITPolicyRunner:
         self._last_yaw_pred = yaw.cpu().numpy().flatten()
 
         # Update observation with predicted yaw (scaled by 1.5 as in training)
-        obs_tensor[:, 6:8] = 1.5 * yaw
+        # NOTE: The depth encoder has a bias of ~0.08 for flat ground, causing drift.
+        # Set zero_yaw_pred=True to disable depth-based yaw and walk straight.
+        if getattr(self, 'zero_yaw_pred', False):
+            obs_tensor[:, 6:8] = 0.0  # Walk straight, ignore depth-based yaw
+        else:
+            obs_tensor[:, 6:8] = 1.5 * yaw
 
         # Run JIT policy (estimator + actor)
         # The JIT policy expects (obs, depth_latent)

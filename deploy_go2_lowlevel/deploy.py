@@ -881,9 +881,10 @@ class Go2VisionController:
 
             # Print summary every second
             if self.walk_startup_counter % 50 == 0:
+                yaw_clamped = " CLAMPED!" if abs(self.delta_yaw) > 0.5 else ""
                 print(f"  Raw: [{action.min():.2f},{action.max():.2f}] | "
                       f"Obs(±{self.config.clip_actions:.1f}): [{action_for_obs.min():.2f},{action_for_obs.max():.2f}] | "
-                      f"d={self.distance_traveled:.2f}m yaw={np.degrees(self.delta_yaw):.1f}°")
+                      f"d={self.distance_traveled:.2f}m yaw={np.degrees(self.delta_yaw):.1f}°{yaw_clamped}")
 
     def _log_walk_data(self, depth_image, obs, action_raw, action_clipped, target_pos):
         """Log comprehensive walking data to file for analysis."""
@@ -1093,8 +1094,10 @@ class Go2VisionController:
             f.write(f"  [0:3]   ang_vel*0.25:    [{proprio[0]:.4f}, {proprio[1]:.4f}, {proprio[2]:.4f}]\n")
             f.write(f"  [3:5]   roll,pitch:      [{proprio[3]:.4f}, {proprio[4]:.4f}]\n")
             f.write(f"  [5]     delta_yaw_mask:  {proprio[5]:.4f}\n")
-            f.write(f"  [6]     delta_yaw:       {proprio[6]:.4f}\n")
-            f.write(f"  [7]     delta_next_yaw:  {proprio[7]:.4f}\n")
+            yaw_clamped_str = " (CLAMPED from {:.4f})".format(self.delta_yaw) if abs(self.delta_yaw) > 0.5 else ""
+            f.write(f"  [6]     delta_yaw:       {proprio[6]:.4f}{yaw_clamped_str}\n")
+            next_yaw_clamped_str = " (CLAMPED from {:.4f})".format(self.delta_next_yaw) if abs(self.delta_next_yaw) > 0.5 else ""
+            f.write(f"  [7]     delta_next_yaw:  {proprio[7]:.4f}{next_yaw_clamped_str}\n")
             f.write(f"  [8:10]  cmd (masked):    [{proprio[8]:.4f}, {proprio[9]:.4f}] (should be 0,0)\n")
             f.write(f"  [10]    cmd (vx):        {proprio[10]:.4f} (should be {self.config.command_vx})\n")
             f.write(f"  [11:13] env_class:       [{proprio[11]:.4f}, {proprio[12]:.4f}]\n")
@@ -1311,12 +1314,18 @@ class Go2VisionController:
         # Training observation order from legged_robot.py lines 393-407:
         # ang_vel(3), imu_obs(2), 0*delta_yaw(1), delta_yaw(1), delta_next_yaw(1),
         # 0*commands[:2](2), commands[0:1](1), env_class(2), dof_pos(12), dof_vel(12), last_action(12), contacts(4)
+
+        # CLAMP delta_yaw to training distribution (training uses delta_yaw < 0.6)
+        # Large yaw errors cause extreme policy outputs (out of distribution)
+        delta_yaw_clipped = np.clip(self.delta_yaw, -0.5, 0.5)
+        delta_next_yaw_clipped = np.clip(self.delta_next_yaw, -0.5, 0.5)
+
         proprio = np.concatenate([
             ang_vel * ang_vel_scale,       # 3  [0:3]
             [roll, pitch],                  # 2  [3:5]
             [0.0],                          # 0*delta_yaw (masked) [5]
-            [self.delta_yaw],               # delta_yaw [6] = 0 (walk straight)
-            [self.delta_next_yaw],          # delta_next_yaw [7] = 0
+            [delta_yaw_clipped],            # delta_yaw [6] - CLAMPED to ±0.5
+            [delta_next_yaw_clipped],       # delta_next_yaw [7] - CLAMPED to ±0.5
             [0.0, 0.0],                     # 0*commands[:2] (MASKED vx,vy) [8:10]
             [self.config.command_vx],       # commands[0:1] = vx [10] - forward velocity
             [1.0, 0.0],                     # env_class flags [11:13]
@@ -1413,6 +1422,8 @@ def main():
                         help='Rotate camera 180 degrees (for inverted mounting like parkour)')
     parser.add_argument('--no_torque_clip', action='store_true',
                         help='Disable torque clipping (not recommended)')
+    parser.add_argument('--zero_yaw', action='store_true',
+                        help='Zero out depth encoder yaw prediction (walk straight, ignore obstacles)')
     args = parser.parse_args()
 
     # Find models
@@ -1472,6 +1483,11 @@ def main():
     if args.no_torque_clip:
         controller.torque_clip_enabled = False
         print("⚠️  WARNING: Torque clipping disabled - motor damage possible!")
+
+    # Zero out depth encoder yaw prediction (walk straight)
+    if args.zero_yaw:
+        policy.zero_yaw_pred = True
+        print("✓ Yaw prediction disabled (walking straight, ignoring depth-based yaw)")
 
     # Setup signal handler for safe shutdown
     def signal_handler(sig, frame):
