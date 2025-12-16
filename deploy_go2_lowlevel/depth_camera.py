@@ -25,27 +25,33 @@ class D435iCamera:
 
     def __init__(
         self,
-        width: int = 424,
-        height: int = 240,
+        width: int = 640,       # Parkour default: 640
+        height: int = 480,      # Parkour default: 480
         fps: int = 30,
         target_width: int = 87,
         target_height: int = 58,
-        near_clip: float = 0.0,
-        far_clip: float = 2.0,
+        near_clip: float = 0.3,
+        far_clip: float = 3.0,
         rotate_180: bool = False,  # Set True if camera is mounted inverted (like parkour)
+        # Parkour cropping settings (applied before resize)
+        crop_left: int = 28,    # Parkour default: 28
+        crop_right: int = 36,   # Parkour default: 36
+        crop_top: int = 48,     # Parkour default: 48
+        crop_bottom: int = 0,   # Parkour default: 0
     ):
         """
         Initialize D435i camera.
 
         Args:
-            width: Capture width (native resolution)
-            height: Capture height (native resolution)
+            width: Capture width (native resolution) - parkour uses 640
+            height: Capture height (native resolution) - parkour uses 480
             fps: Capture framerate
             target_width: Output width for policy (after resize)
             target_height: Output height for policy (after resize)
             near_clip: Minimum depth in meters
             far_clip: Maximum depth in meters
             rotate_180: Rotate image 180 degrees (for inverted camera mounting)
+            crop_left/right/top/bottom: Pixels to crop from each edge (parkour defaults)
         """
         self.width = width
         self.height = height
@@ -55,6 +61,10 @@ class D435iCamera:
         self.near_clip = near_clip
         self.far_clip = far_clip
         self.rotate_180 = rotate_180
+        self.crop_left = crop_left
+        self.crop_right = crop_right
+        self.crop_top = crop_top
+        self.crop_bottom = crop_bottom
 
         self.pipeline = None
         self.config = None
@@ -151,7 +161,12 @@ class D435iCamera:
         Process raw depth frame to policy input format.
 
         IMPORTANT: This MUST match training preprocessing exactly!
-        Training: crop → clip → resize → normalize to [-0.5, 0.5]
+        Processing order (matching parkour go2_visual.py):
+        1. Rotate 180° (if camera inverted)
+        2. Crop edges (parkour: top=48, bottom=0, left=28, right=36)
+        3. Clip depth range
+        4. Resize to target (87x58)
+        5. Normalize to [-0.5, 0.5]
 
         Args:
             depth_frame: RealSense depth frame
@@ -162,30 +177,37 @@ class D435iCamera:
         # Convert to numpy array (in millimeters for z16)
         depth_image = np.asanyarray(depth_frame.get_data()).astype(np.float32)
 
-        # Rotate 180 degrees if camera is mounted inverted (from parkour)
+        # STEP 1: Rotate 180 degrees if camera is mounted inverted (from parkour)
         if self.rotate_180:
             depth_image = np.rot90(depth_image, k=2)  # k=2 for 180 degree rotation
 
         # Convert to meters (negative as in Isaac Gym depth)
         depth_image = -depth_image * self.depth_scale
 
-        # STEP 1: CROP edges (matching training: depth_image[:-2, 4:-4])
-        # Remove 4 pixels from left/right, 2 pixels from bottom
-        # From 424x240 → 416x238
-        depth_image = depth_image[:-2, 4:-4]
+        # STEP 2: CROP edges (matching parkour go2_visual.py)
+        # Parkour: crop_top=48, crop_bottom=0, crop_left=28, crop_right=36
+        # From 640x480 → (640-28-36) x (480-48-0) = 576 x 432
+        top = self.crop_top
+        bottom = self.crop_bottom if self.crop_bottom > 0 else None
+        left = self.crop_left
+        right = -self.crop_right if self.crop_right > 0 else None
 
-        # STEP 2: Clip to valid range (negative values!)
+        if bottom is None:
+            depth_image = depth_image[top:, left:right]
+        else:
+            depth_image = depth_image[top:-bottom, left:right]
+
+        # STEP 3: Clip to valid range (negative values!)
         depth_image = np.clip(depth_image, -self.far_clip, -self.near_clip)
 
-        # STEP 3: Resize to target dimensions
-        # From 416x238 → 87x58
+        # STEP 4: Resize to target dimensions (87x58)
         depth_image = cv2.resize(
             depth_image,
             (self.target_width, self.target_height),
             interpolation=cv2.INTER_AREA
         )
 
-        # STEP 4: Normalize (matching training exactly)
+        # STEP 5: Normalize (matching training exactly)
         # Training formula: (depth - near) / (far - near) - 0.5
         # This gives: close (0.3m) → -0.5, far (3.0m) → +0.5
         depth_image = depth_image * -1  # Make positive (0.3m to 3.0m range)
@@ -193,10 +215,6 @@ class D435iCamera:
         # Match training normalization exactly:
         # (depth - near_clip) / (far_clip - near_clip) - 0.5
         depth_image = (depth_image - self.near_clip) / (self.far_clip - self.near_clip) - 0.5
-
-        # STEP 5: Fix stuck left edge pixels (camera artifact)
-        # Copy column 1 to column 0 to remove the -0.5 stuck pixels
-        depth_image[:, 0] = depth_image[:, 1]
 
         # Result: range [-0.5, 0.5]
         #   near (0.3m) → (0.3-0.3)/(3.0-0.3) - 0.5 = -0.5  (CLOSE = LOW)

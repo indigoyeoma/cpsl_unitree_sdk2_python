@@ -1417,7 +1417,7 @@ def main():
     print("Loading policy...")
     policy = JITPolicyRunner(vision_weight_path, base_jit_path, args.device)
 
-    # Create camera
+    # Create camera (using parkour-matching settings: 640x480, crop L=28 R=36 T=48 B=0)
     camera = create_camera(
         use_real=not args.use_dummy_camera,
         target_width=DeployConfig.depth_width,
@@ -1426,6 +1426,8 @@ def main():
         far_clip=DeployConfig.depth_far,
         rotate_180=args.rotate_camera,  # For inverted camera mounting
     )
+    print(f"✓ Camera: 640x480 → crop(L=28,R=36,T=48,B=0) → resize to {DeployConfig.depth_width}x{DeployConfig.depth_height}")
+    print(f"  Depth range: {DeployConfig.depth_near}m - {DeployConfig.depth_far}m → normalized [-0.5, +0.5]")
     if args.rotate_camera:
         print("✓ Camera rotation enabled (180°)")
 
