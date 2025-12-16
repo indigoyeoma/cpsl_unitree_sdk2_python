@@ -4,44 +4,125 @@ Deploy trained vision-based parkour policies to the Unitree Go2 robot using low-
 
 ## Overview
 
-This deploys a student (vision) policy trained with the teacher-student framework. The policy uses:
+This deploys a student (vision) policy trained with the CPSL teacher-student framework. The system uses:
 - **Intel RealSense D435i** depth camera for vision
 - **Real robot sensors** (IMU, joint encoders, foot forces)
-- **Low-level motor control** at 500Hz (50Hz policy)
+- **Low-level motor control** at 500Hz with 50Hz policy inference
 
-The vision policy replaces terrain scans, enabling real-world deployment without privileged information.
+The vision policy replaces terrain height scans with depth images, enabling real-world deployment.
+
+## Architecture
+
+```
+Training (Simulation)                    Deployment (Real Robot)
+─────────────────────                    ───────────────────────
+Teacher Policy                           Student Policy
+  - Uses height scans (132 pts)            - Uses D435i depth camera
+  - Privileged terrain info                - No privileged info
+
+       ↓ Distillation                     D435i Camera (424x240)
+                                                ↓
+Student Policy                           Crop (parkour ratios)
+  - Uses simulated depth                       ↓
+  - Learns from teacher                  Resize to 87x58
+                                               ↓
+                                         Normalize [-0.5, +0.5]
+                                               ↓
+                                         Depth Encoder → 32-dim latent
+                                               ↓
+                                         Policy: obs + latent → actions
+```
 
 ## Files
 
 ```
 deploy_go2_lowlevel/
-├── deploy.py          # Main deployment script
-├── config.py          # Configuration (PD gains, command velocity, etc.)
-├── depth_camera.py    # D435i camera interface
-├── policy_jit.py      # JIT policy loader
-├── README.md          # This file
-└── policy/            # Your trained models go here
-    ├── student_depth-xxxxx-base_jit.pt
-    └── student_depth-xxxxx-vision_weight.pt
+├── deploy.py              # Main deployment script (state machine)
+├── config.py              # Configuration (PD gains, joint mapping, etc.)
+├── depth_camera.py        # D435i camera interface with parkour preprocessing
+├── policy_jit.py          # JIT policy loader (depth encoder + base policy)
+├── test_camera.py         # Test camera independently
+├── CAMERA_SETUP_GUIDE.md  # D435i setup instructions
+├── D435I_MODES_GUIDE.md   # Camera mode documentation
+└── policy/                # Trained models directory
+    ├── *-base_jit.pt      # JIT traced policy
+    └── *-vision_weight.pt # Depth encoder weights
 ```
 
-## Prerequisites
+## Camera Settings (Matching Parkour)
 
-### Software
-```bash
-# Install pyrealsense2 for D435i camera
-pip install pyrealsense2
+**Critical:** Camera preprocessing must match training exactly!
 
-# Install PyTorch (if not already installed)
-pip install torch
+| Setting | Parkour Reference (640x480) | Deployment (424x240) | Training Sim (106x60) |
+|---------|----------------------------|----------------------|----------------------|
+| crop_top | 48 (10%) | 24 (10%) | 6 (10%) |
+| crop_bottom | 0 (0%) | 0 (0%) | 0 (0%) |
+| crop_left | 28 (4.4%) | 19 (4.5%) | 5 (4.7%) |
+| crop_right | 36 (5.6%) | 24 (5.7%) | 6 (5.7%) |
+| near_clip | - | 0.3m | 0.3m |
+| far_clip | - | 3.0m | 3.0m |
+| output | 87x58 | 87x58 | 87x58 |
+| normalization | - | [-0.5, +0.5] | [-0.5, +0.5] |
 
-# Unitree SDK is already in parent directory
+**Normalization formula:**
+```python
+depth_normalized = (depth_meters - near_clip) / (far_clip - near_clip) - 0.5
+# Result: -0.5 = close (0.3m), +0.5 = far (3.0m)
 ```
 
-### Hardware
-- Unitree Go2 robot
-- Intel RealSense D435i depth camera mounted on robot head
-- Network connection to robot (Ethernet or WiFi)
+**Edge artifact fix:** Left column copied from column 1 to handle D435i edge artifacts.
+
+## Control Parameters
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Policy frequency | 50 Hz | Matches training decimation=4 |
+| Motor command rate | 500 Hz | Smooth control |
+| Kp (walking) | 25.0 | Matches training stiffness |
+| Kd (walking) | 0.6 | Matches training damping |
+| Kp (standing) | 70.0 | Stiffer for stability |
+| Kd (standing) | 3.0 | Higher damping |
+| action_scale | 0.25 | Matches training |
+| clip_actions | 1.2 | Observation clipping (parkour style) |
+
+## Joint Order Mapping
+
+**Training (URDF) order:** FL, FR, RL, RR (hip, thigh, calf each)
+**SDK order:** FR, FL, RR, RL (hip, thigh, calf each)
+
+The deployment code automatically converts between these orders.
+
+## Button Controls
+
+| Button | Action |
+|--------|--------|
+| **L1** | Start walking (STANDING → WALKING) |
+| **Y** | Stop walking (WALKING → STANDING) |
+| **B** | Print depth + IMU debug info (saves to depth_imu_log.txt) |
+| **Ctrl+C** | Emergency stop → damping mode |
+
+## State Machine
+
+```
+                    ┌─────────┐
+                    │  IDLE   │ (damping mode, waiting)
+                    └────┬────┘
+                         │ Y button
+                         ▼
+                    ┌─────────┐
+                    │STANDING │ (interpolate to stand pose)
+                    └────┬────┘
+                         │ L1 button
+                         ▼
+                    ┌─────────┐
+                    │ WALKING │ (vision policy active)
+                    └────┬────┘
+                         │ Y button
+                         ▼
+                    ┌─────────┐
+                    │STANDING │
+                    └─────────┘
+```
 
 ## Quick Start
 
@@ -50,53 +131,57 @@ pip install torch
 ```bash
 cd /home/nvidiasims/ws_go2/cpsl_go2_rl_repo/legged_gym
 
-# Train teacher (uses terrain scans)
-python legged_gym/scripts/train.py --task go2 --proj_name parkour_go2 --exptid teacher_step
-
-# Train student (uses depth camera, distills from teacher)
-python legged_gym/scripts/train.py --task go2 --proj_name parkour_go2 --exptid student_depth \
-       --use_camera --resume --resumeid teacher_step
-
-# Verify in simulation
-python legged_gym/scripts/play.py --task go2 --proj_name parkour_go2 --exptid student_depth --use_camera
+# Train student with depth camera (distills from teacher)
+python train.py --task go2_student \
+    --exptid go2_student \
+    --load_run ../../logs/go2_teacher/go2_teacher \
+    --use_camera \
+    --headless \
+    --no_wandb \
+    --max_iterations 15005
 ```
+
+**Training uses:**
+- Single depth frame per timestep (buffer_len=1)
+- Parkour-style crop ratios
+- near_clip=0.3m, far_clip=3.0m
+- 192 parallel environments (camera_num_envs)
 
 ### 2. Export JIT Models
 
 ```bash
 cd /home/nvidiasims/ws_go2/cpsl_go2_rl_repo/legged_gym
 
-# Export to JIT format
-python legged_gym/scripts/save_jit.py --exptid student_depth --checkpoint -1
+# Export to JIT format for deployment
+python legged_gym/scripts/save_jit.py --exptid go2_student --checkpoint -1
 ```
 
-This creates in `logs/parkour_go2/student_depth/traced/`:
-- `student_depth-<ckpt>-vision_weight.pt` - Depth encoder weights
-- `student_depth-<ckpt>-base_jit.pt` - JIT traced policy
+Creates in `logs/go2_student/traced/`:
+- `*-base_jit.pt` - JIT traced policy
+- `*-vision_weight.pt` - Depth encoder weights
 
-### 3. Copy Models to Deployment
+### 3. Copy Models
 
 ```bash
-# Copy JIT models to deployment directory
-cp logs/parkour_go2/student_depth/traced/*.pt \
+cp logs/go2_student/traced/*.pt \
    /home/nvidiasims/ws_go2/cpsl_unitree_sdk2_python/deploy_go2_lowlevel/policy/
 ```
 
 ### 4. Deploy to Robot
 
-**Test with dummy camera first (safe!):**
 ```bash
 cd /home/nvidiasims/ws_go2/cpsl_unitree_sdk2_python/deploy_go2_lowlevel
 
-python deploy.py --command_vx 0.5 --use_dummy_camera
+# Run deployment
+python deploy.py
 ```
 
-**Deploy to real robot:**
-```bash
-cd /home/nvidiasims/ws_go2/cpsl_unitree_sdk2_python/deploy_go2_lowlevel
-
-python deploy.py --command_vx 0.5
-```
+**Deployment sequence:**
+1. Press **Y** to enter STANDING mode
+2. Robot interpolates to standing pose
+3. Press **L1** to start WALKING
+4. Robot walks forward using vision policy
+5. Press **Y** to stop, **Ctrl+C** for emergency stop
 
 ## Command Line Options
 
@@ -104,174 +189,116 @@ python deploy.py --command_vx 0.5
 python deploy.py [options]
 
 Options:
-  --command_vx FLOAT       Forward velocity goal in m/s (default: 0.5)
+  --command_vx FLOAT       Forward velocity goal (default: 0.3 m/s)
   --device DEVICE          cuda or cpu (default: cuda)
-  --use_dummy_camera       Use dummy depth images for testing
-  --network_interface IF   Network interface for DDS (e.g., eth0)
-  --policy_dir DIR         Directory with JIT models (default: ./policy/)
-  --vision_weight PATH     Direct path to vision_weight.pt (optional)
-  --base_jit PATH          Direct path to base_jit.pt (optional)
+  --use_dummy_camera       Use dummy depth for testing without camera
+  --network_interface IF   Network interface for DDS
 ```
 
-## Command Velocity Guide
+## Debugging
 
-The `--command_vx` parameter sets the **walking speed goal**:
+### B Button Debug Output
 
-| Value | Behavior | Recommended Use |
-|-------|----------|-----------------|
-| 0.0   | Stand still | Testing stance |
-| 0.3   | Slow walk | Initial testing |
-| 0.5   | Medium walk | **Start here** |
-| 0.8   | Fast walk | After confidence |
-| 1.0   | Very fast | Use with caution |
+Press **B** during operation to log:
+- IMU data (roll, pitch, yaw, angular velocity)
+- Depth image statistics and samples
+- Current observations
+- Saves to `depth_imu_log.txt`
 
-**Important:** This is a **goal**, not actual velocity. The policy tries to achieve this speed.
+### Walk Log
 
-## Deployment Flow
+During walking, comprehensive logs saved to `walk_log.txt` every 0.2 seconds:
+- Joint positions/velocities
+- Actions (raw and clipped)
+- Depth image analysis
+- Navigation state
 
-1. **Initialization** (5 seconds)
-   - Connects to robot via DDS
-   - Releases built-in motion controller
-   - Loads JIT models
-   - Starts D435i camera
+### Common Issues
 
-2. **Standup** (2 seconds)
-   - Smoothly interpolates to standing pose
+**Robot turns right constantly:**
+- Left-edge camera artifact causing phantom obstacle detection
+- Fixed by cropping and edge copy (`depth[:, 0] = depth[:, 1]`)
 
-3. **Vision Control Loop**
-   - **500Hz**: Motor commands (PD control)
-   - **50Hz**: Policy inference
-     1. Capture depth image from D435i
-     2. Read sensors (IMU, joints, contacts)
-     3. depth_encoder: depth image → 32-dim latent
-     4. policy: obs + depth_latent → 12 joint actions
-     5. Apply with smooth 10-second startup ramp
+**Jerky movements:**
+- PD gains mismatch (should be Kp=25, Kd=0.6 for walking)
+- Action scale mismatch (should be 0.25)
+- Check depth normalization range
 
-4. **Shutdown**
-   - Press Ctrl+C anytime
-   - Motors switch to damping mode
+**Robot doesn't respond to obstacles:**
+- Verify camera is connected: `rs-enumerate-devices`
+- Check depth values with B button
+- Ensure near_clip/far_clip match training
 
-## How Vision Works (No Height Scans!)
+**Policy loading fails:**
+- Ensure both `.pt` files are in `policy/` directory
+- Check PyTorch version compatibility
 
-**Training:** Policy learned with terrain height scans (132 points)
-
-**Deployment:** D435i depth camera replaces height scans
+## Observation Structure
 
 ```
-Observation Vector (753 dims total):
+Total observation: 753 dimensions
 
-  proprio (53):
-    - IMU: angular velocity (3), roll/pitch (2)
-    - Commands: yaw (3), velocity GOAL (1)  ← YOU SET THIS
-    - Env flags (2)
-    - Joint positions relative to default (12)
-    - Joint velocities (12)
-    - Last action (12)
-    - Foot contacts (4)
+proprio (53):
+  [0:3]   angular_velocity * 0.25
+  [3:5]   roll, pitch
+  [5]     delta_yaw_mask (0 = use delta_yaw)
+  [6]     delta_yaw (to goal)
+  [7]     delta_next_yaw
+  [8:10]  commands (masked, zeros)
+  [10]    command_vx (forward velocity goal)
+  [11:13] env_class one-hot
+  [13:25] dof_pos - default_pos (12 joints)
+  [25:37] dof_vel * 0.05 (12 joints)
+  [37:49] last_action (12 joints)
+  [49:53] foot_contacts (±0.5)
 
-  scan (132): ALL ZEROS - no height scans in real world!
+scan (132): ZEROS (replaced by depth encoder)
 
-  priv_explicit (9): ZEROS - estimator predicts internally
+priv_explicit (9): ZEROS
 
-  priv_latent (29): ZEROS - not used by student
+priv_latent (29): ZEROS
 
-  history (530): Last 10 proprio observations
+history (530): Last 10 proprio observations (53 * 10)
 
-Vision Processing (separate from observation):
-  depth_image (58x87) → depth_encoder → depth_latent (32)
-
-Policy receives: obs (753) + depth_latent (32) → actions (12)
+Depth processing (separate):
+  D435i (424x240) → crop → resize (87x58) → normalize → encoder → latent (32)
 ```
-
-**Key insight:** Vision replaces scans. The depth encoder processes D435i images into a 32-dim feature that the policy uses instead of terrain heights.
 
 ## Safety Features
 
-- ✅ **Smooth startup**: 10-second ramp avoids sudden movements
-- ✅ **Joint limits**: Commands clipped to safe ranges
-- ✅ **Action scaling**: 0.25× scaling limits speed
-- ✅ **Emergency stop**: Ctrl+C anytime → damping mode
-- ✅ **Safety confirmation**: Requires user confirmation before starting
+- **Smooth standup**: 2-second interpolation to standing pose
+- **Walking ramp**: Gradual action scaling during first 10 seconds
+- **Joint limits**: Hardware limits enforced
+- **Torque clipping**: Prevents excessive forces
+- **Emergency stop**: Ctrl+C → immediate damping mode
+- **State confirmation**: Button presses required for state transitions
 
-## Camera Mounting
+## Technical Notes
 
-Mount D435i on Go2 head:
-- **Position**: ~30cm forward, 7cm up from base_link
-- **Orientation**: Forward-facing, ~5° down angle
-- **FOV**: 86° horizontal (D435i spec)
-- **Must match**: Training config in `go2_parkour_config.py`
+### Why Parkour Crop Ratios?
 
-Verify mounting matches training, or robot may behave erratically!
+The parkour repository (extreme-parkour) uses specific crop ratios to:
+1. Remove top 10% (sky/ceiling artifacts)
+2. Asymmetric left/right crops (4.4% vs 5.6%) for camera alignment
+3. No bottom crop (floor is important for locomotion)
 
-## Troubleshooting
+We match these ratios proportionally in both training and deployment.
 
-### Camera not found
-```bash
-# Check if D435i is connected
-rs-enumerate-devices
+### Depth Normalization
 
-# Test camera
-realsense-viewer
-```
+Training uses Isaac Gym depth convention:
+- Negative values in simulation (closer = more negative)
+- We convert to positive, then normalize to [-0.5, +0.5]
+- -0.5 = close (0.3m), +0.5 = far (3.0m)
 
-### Robot not responding
-- Check power and network
-- Try `--network_interface eth0`
-- Verify robot is not in error state
+### Joint Order
 
-### Robot falls or jerky movement
-- **Start slower**: Use `--command_vx 0.3`
-- Check camera is firmly mounted
-- Verify training worked well in simulation
-- Check floor lighting (affects depth camera)
+Isaac Gym URDF loads joints in FL, FR, RL, RR order.
+Unitree SDK uses FR, FL, RR, RL order.
+`config.py` contains the mapping indices.
 
-### Model loading errors
-- Verify files exist in `policy/` directory
-- Check PyTorch version matches training
-- Ensure both `.pt` files are present
+## References
 
-### ImportError or module issues
-```bash
-# Make sure you're in the right directory
-cd /home/nvidiasims/ws_go2/cpsl_unitree_sdk2_python/deploy_go2_lowlevel
-
-# Install SDK if needed
-cd .. && pip install -e .
-```
-
-## Technical Details
-
-- **Control frequency**: 500Hz motor commands, 50Hz policy (matches training decimation)
-- **PD gains**: Kp=40, Kd=1 (from training config)
-- **Action scale**: 0.25 (from training config)
-- **Depth processing**: 424x240@30fps → resize to 87x58 → normalize [0,1]
-- **Joint order**: Converts between training (FL,FR,RL,RR) and SDK (FR,FL,RR,RL)
-
-## Tips for Success
-
-1. **Start conservative**: Begin with `--command_vx 0.3`, increase gradually
-2. **Test in simulation first**: Verify policy works with `play.py --use_camera`
-3. **Clear space**: Remove obstacles, test on flat ground first
-4. **Good lighting**: Depth camera needs decent lighting
-5. **Secure mounting**: Camera must not move during operation
-6. **Monitor startup**: Watch the 10-second ramp, stop if issues
-
-## What to Expect
-
-- **Seconds 0-10**: Gradual ramp from standing to walking
-- **After 10s**: Policy runs at full strength
-- **Walking**: Should achieve roughly the commanded velocity
-- **Vision**: Robot should react to visible obstacles/terrain
-
-If robot walks but ignores obstacles, check camera mounting and focus.
-
-## Files Explained
-
-- **`deploy.py`**: Main script, handles everything
-- **`policy_jit.py`**: Loads depth_encoder + JIT policy
-- **`depth_camera.py`**: D435i capture and preprocessing
-- **`config.py`**: Robot parameters (PD gains, limits, dimensions)
-
-## Contact
-
-For issues, see main repository or check logs in deployment directory.
+- CPSL Go2 RL Repo: `/home/nvidiasims/ws_go2/cpsl_go2_rl_repo/`
+- Parkour Reference: `/home/nvidiasims/ws_go2/parkour/`
+- Training Config: `cpsl_go2_rl_repo/legged_gym/legged_gym/envs/go2/go2_student_config.py`

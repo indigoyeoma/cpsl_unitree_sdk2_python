@@ -33,11 +33,13 @@ class D435iCamera:
         near_clip: float = 0.3,
         far_clip: float = 3.0,
         rotate_180: bool = False,  # Set True if camera is mounted inverted
-        # Cropping settings (matching CPSL training: [:-2, 4:-4] scaled for 424x240)
-        crop_left: int = 4,     # Match training crop ratio
-        crop_right: int = 4,    # Match training crop ratio
-        crop_top: int = 0,      # No top crop in training
-        crop_bottom: int = 2,   # Match training [:-2] crop
+        # Cropping settings (matching parkour go2_visual.py ratios)
+        # Parkour uses 640x480 with crop_top=48, crop_left=28, crop_right=36, crop_bottom=0
+        # Proportions: top=10%, left=4.4%, right=5.6%, bottom=0%
+        crop_left: int = 19,    # 424 * 0.044 ≈ 19 (matches parkour 4.4% left crop)
+        crop_right: int = 24,   # 424 * 0.056 ≈ 24 (matches parkour 5.6% right crop)
+        crop_top: int = 24,     # 240 * 0.10 = 24 (matches parkour 10% top crop)
+        crop_bottom: int = 0,   # No bottom crop (matches parkour)
     ):
         """
         Initialize D435i camera.

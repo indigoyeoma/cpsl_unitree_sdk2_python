@@ -15,7 +15,7 @@ class DeployConfig:
     clip_actions = 1.2  # Action clipping (matches training - ±4.8 raw → ±1.2 rad)
 
     # PD gains for WALKING (must match training for sim2real)
-    # Training used: kp=25.0, kd=0.6 (from go2_config.py)
+    # Training uses: kp=25.0, kd=0.6
     kp_walk = 25.0  # stiffness for walking (matches training)
     kd_walk = 0.6   # damping for walking (matches training)
 
