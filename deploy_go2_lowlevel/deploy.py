@@ -444,18 +444,17 @@ class Go2VisionController:
                 self.phase = self.PHASE_STAND_TO_SIT
                 self.percent_stand_to_sit = 0.0
 
-        # L1 button: Enter debug mode (from STANDING) - TEMPORARILY FOR TESTING
+        # L1 button: Start walking policy (from STANDING)
         if self._check_l1_pressed():
             if self.phase == self.PHASE_STANDING:
-                print("\n[L1] Entering DEBUG MODE (L1 remapped for testing)...")
-                self.phase = self.PHASE_DEBUG
-                self.debug_counter = 0
-                # Clear the debug file at start
-                open("debug_output.txt", "w").close()
+                print("\n[L1] Starting walking policy...")
+                self.phase = self.PHASE_WALKING
+                self.walk_startup_counter = 0
+                self._reset_walk_state()
                 print("\n" + "=" * 60)
-                print("DEBUG MODE - Printing sensor data, holding standing pose")
-                print("  Output saved to: debug_output.txt")
-                print("  Press A to exit, Y to sit down")
+                print("WALKING - Vision policy active")
+                print("  Press Y to exit to standing")
+                print("  Press L2/R2 for EMERGENCY STOP")
                 print("=" * 60 + "\n")
 
         # A button: Enter/exit debug mode (from STANDING or WALKING)
@@ -597,7 +596,10 @@ class Go2VisionController:
         proprio = obs[:self.config.n_proprio]
 
         # Run policy to get action (but don't apply)
-        action = self.policy.get_action(depth_image, obs)
+        action_raw = self.policy.get_action(depth_image, obs)
+
+        # Convert to SDK order (same as walking phase)
+        action_sdk = self._training_to_sdk_order(action_raw)
 
         # Print everything (and save to file)
         import datetime
@@ -638,12 +640,18 @@ class Go2VisionController:
         debug_print(f"  Min/Max: [{depth_image.min():.3f}, {depth_image.max():.3f}]")
         debug_print(f"  Mean: {depth_image.mean():.3f}")
 
-        debug_print("\n--- Policy Action Output (unscaled, SDK order) ---")
-        debug_print(f"  FR: [{action[0]:.3f}, {action[1]:.3f}, {action[2]:.3f}]")
-        debug_print(f"  FL: [{action[3]:.3f}, {action[4]:.3f}, {action[5]:.3f}]")
-        debug_print(f"  RR: [{action[6]:.3f}, {action[7]:.3f}, {action[8]:.3f}]")
-        debug_print(f"  RL: [{action[9]:.3f}, {action[10]:.3f}, {action[11]:.3f}]")
-        debug_print(f"  Action range: [{action.min():.3f}, {action.max():.3f}]")
+        debug_print("\n--- Policy Action RAW (training order: FL,FR,RL,RR) ---")
+        debug_print(f"  FL: [{action_raw[0]:.3f}, {action_raw[1]:.3f}, {action_raw[2]:.3f}]")
+        debug_print(f"  FR: [{action_raw[3]:.3f}, {action_raw[4]:.3f}, {action_raw[5]:.3f}]")
+        debug_print(f"  RL: [{action_raw[6]:.3f}, {action_raw[7]:.3f}, {action_raw[8]:.3f}]")
+        debug_print(f"  RR: [{action_raw[9]:.3f}, {action_raw[10]:.3f}, {action_raw[11]:.3f}]")
+        debug_print(f"  Raw range: [{action_raw.min():.3f}, {action_raw.max():.3f}]")
+
+        debug_print("\n--- Policy Action CONVERTED (SDK order: FR,FL,RR,RL) ---")
+        debug_print(f"  FR: [{action_sdk[0]:.3f}, {action_sdk[1]:.3f}, {action_sdk[2]:.3f}]")
+        debug_print(f"  FL: [{action_sdk[3]:.3f}, {action_sdk[4]:.3f}, {action_sdk[5]:.3f}]")
+        debug_print(f"  RR: [{action_sdk[6]:.3f}, {action_sdk[7]:.3f}, {action_sdk[8]:.3f}]")
+        debug_print(f"  RL: [{action_sdk[9]:.3f}, {action_sdk[10]:.3f}, {action_sdk[11]:.3f}]")
 
         debug_print("\n--- Proprio Observation (first 53 dims) ---")
         debug_print(f"  [0:3]   ang_vel*0.25:     [{proprio[0]:.3f}, {proprio[1]:.3f}, {proprio[2]:.3f}]")
@@ -663,8 +671,8 @@ class Go2VisionController:
         debug_print(f"  RL: [{la[9]:.3f}, {la[10]:.3f}, {la[11]:.3f}]")
         debug_print(f"  (zeros = entered from standing, non-zero = entered from walking)")
 
-        debug_print("\n--- Target Position (if walking) ---")
-        target = self.config.default_joint_angles + action * self.config.action_scale
+        debug_print("\n--- Target Position (SDK order, using converted action) ---")
+        target = self.config.default_joint_angles + action_sdk * self.config.action_scale
         debug_print(f"  FR: [{target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f}]")
         debug_print(f"  FL: [{target[3]:.3f}, {target[4]:.3f}, {target[5]:.3f}]")
         debug_print(f"  RR: [{target[6]:.3f}, {target[7]:.3f}, {target[8]:.3f}]")
@@ -703,20 +711,23 @@ class Go2VisionController:
             clip_limit = self.config.clip_actions / self.config.action_scale  # 4.8
             action = np.clip(action, -clip_limit, clip_limit)
 
-            # Scale action and add to default pose
-            # Policy outputs in SDK/observation order (FR,FL,RR,RL), same as SDK!
-            target_delta = action * self.config.action_scale
-            target_pos = self.config.default_joint_angles + target_delta  # Both in SDK order
+            # CRITICAL: Convert action from training order (FL,FR,RL,RR) to SDK order (FR,FL,RR,RL)
+            # The policy was trained with reindexed observations (URDF→SDK) but actions are
+            # applied to URDF-ordered DOFs in the simulator. So policy outputs in training/URDF order.
+            action_sdk = self._training_to_sdk_order(action)
+
+            # Scale action and add to default pose (both now in SDK order)
+            target_delta = action_sdk * self.config.action_scale
+            target_pos = self.config.default_joint_angles + target_delta
 
             # Apply joint limits
             target_pos = JointLimits.clip_joints(target_pos)
 
-            # No conversion needed - already in SDK order!
             self.target_positions = target_pos
 
-            # Update history
-            self.last_action = action
-            self.action_history.append(action)
+            # Update history - store in SDK order to match observation order
+            self.last_action = action_sdk
+            self.action_history.append(action_sdk)
 
             # Debug: print action and depth stats every second
             self.walk_startup_counter += 1
