@@ -663,12 +663,12 @@ class Go2VisionController:
         debug_print(f"  [25:37] dof_vel*0.05:     min={proprio[25:37].min():.3f}, max={proprio[25:37].max():.3f}")
         debug_print(f"  [49:53] contacts:         [{proprio[49]:.1f}, {proprio[50]:.1f}, {proprio[51]:.1f}, {proprio[52]:.1f}]")
 
-        debug_print("\n--- Last Action (from self.last_action, SDK order) ---")
+        debug_print("\n--- Last Action (training order: FL,FR,RL,RR - for observation) ---")
         la = self.last_action
-        debug_print(f"  FR: [{la[0]:.3f}, {la[1]:.3f}, {la[2]:.3f}]")
-        debug_print(f"  FL: [{la[3]:.3f}, {la[4]:.3f}, {la[5]:.3f}]")
-        debug_print(f"  RR: [{la[6]:.3f}, {la[7]:.3f}, {la[8]:.3f}]")
-        debug_print(f"  RL: [{la[9]:.3f}, {la[10]:.3f}, {la[11]:.3f}]")
+        debug_print(f"  FL: [{la[0]:.3f}, {la[1]:.3f}, {la[2]:.3f}]")
+        debug_print(f"  FR: [{la[3]:.3f}, {la[4]:.3f}, {la[5]:.3f}]")
+        debug_print(f"  RL: [{la[6]:.3f}, {la[7]:.3f}, {la[8]:.3f}]")
+        debug_print(f"  RR: [{la[9]:.3f}, {la[10]:.3f}, {la[11]:.3f}]")
         debug_print(f"  (zeros = entered from standing, non-zero = entered from walking)")
 
         debug_print("\n--- Target Position (SDK order, using converted action) ---")
@@ -728,9 +728,10 @@ class Go2VisionController:
 
             self.target_positions = target_pos
 
-            # Update history - store in SDK order to match observation order
-            self.last_action = action_sdk
-            self.action_history.append(action_sdk)
+            # Update history - store in TRAINING order (raw policy output) for observation
+            # The observation last_action should match what the policy sees during training
+            self.last_action = action_raw
+            self.action_history.append(action_raw)
 
             # Log data every 10 policy steps (5 times per second)
             self.walk_startup_counter += 1
@@ -873,13 +874,13 @@ class Go2VisionController:
             f.write(f"  [37:49] last_action:     [{', '.join([f'{x:.3f}' for x in proprio[37:49]])}]\n")
             f.write(f"  [49:53] contacts:        [{proprio[49]:.2f}, {proprio[50]:.2f}, {proprio[51]:.2f}, {proprio[52]:.2f}]\n")
 
-            # ===== LAST ACTION (from history) =====
+            # ===== LAST ACTION (from history, training order) =====
             la = self.last_action
-            f.write(f"\n--- Last Action (SDK order, stored) ---\n")
-            f.write(f"  FR: [{la[0]:.4f}, {la[1]:.4f}, {la[2]:.4f}]\n")
-            f.write(f"  FL: [{la[3]:.4f}, {la[4]:.4f}, {la[5]:.4f}]\n")
-            f.write(f"  RR: [{la[6]:.4f}, {la[7]:.4f}, {la[8]:.4f}]\n")
-            f.write(f"  RL: [{la[9]:.4f}, {la[10]:.4f}, {la[11]:.4f}]\n")
+            f.write(f"\n--- Last Action (training order: FL,FR,RL,RR - for observation) ---\n")
+            f.write(f"  FL: [{la[0]:.4f}, {la[1]:.4f}, {la[2]:.4f}]\n")
+            f.write(f"  FR: [{la[3]:.4f}, {la[4]:.4f}, {la[5]:.4f}]\n")
+            f.write(f"  RL: [{la[6]:.4f}, {la[7]:.4f}, {la[8]:.4f}]\n")
+            f.write(f"  RR: [{la[9]:.4f}, {la[10]:.4f}, {la[11]:.4f}]\n")
 
             # ===== NAVIGATION/GOAL DATA =====
             f.write(f"\n--- Navigation ---\n")
