@@ -70,6 +70,7 @@ class Go2VisionController:
     PHASE_WALKING = 3
     PHASE_STAND_TO_SIT = 4
     PHASE_EMERGENCY = 5
+    PHASE_DEBUG = 6  # Debug mode - prints data, no motor control
 
     # Button constants (from SDK wireless_controller.py)
     # Byte 2 (data1): R1, L1, Start, Select, R2, L2, F1, F3
@@ -172,7 +173,11 @@ class Go2VisionController:
         print(f"\nButton Controls:")
         print(f"  Y     - Stand up / Exit policy")
         print(f"  L1    - Start walking policy")
+        print(f"  A     - DEBUG MODE (print sensors, no motor control)")
         print(f"  L2/R2 - EMERGENCY STOP")
+
+        # Debug mode counter
+        self.debug_counter = 0
 
     def init(self):
         """Initialize SDK channels."""
@@ -338,6 +343,10 @@ class Go2VisionController:
         """Check if L1 button was just pressed."""
         return self._check_button_pressed(self.BUTTON_L1)
 
+    def _check_a_pressed(self):
+        """Check if A button was just pressed."""
+        return self._check_button_pressed(self.BUTTON_A)
+
     def _emergency_motor_shutdown(self):
         """Immediately disable all motors (from parkour)."""
         print("\n" + "!" * 70)
@@ -393,14 +402,16 @@ class Go2VisionController:
             self._phase_walk()
         elif self.phase == self.PHASE_STAND_TO_SIT:
             self._phase_stand_to_sit()
+        elif self.phase == self.PHASE_DEBUG:
+            self._phase_debug()
         elif self.phase == self.PHASE_EMERGENCY:
             pass  # Motors already disabled
 
         # Update button state for edge detection
         self._update_button_state()
 
-        # Send motor commands (except in IDLE and EMERGENCY)
-        if self.phase not in [self.PHASE_IDLE, self.PHASE_EMERGENCY]:
+        # Send motor commands (except in IDLE, EMERGENCY, and DEBUG)
+        if self.phase not in [self.PHASE_IDLE, self.PHASE_EMERGENCY, self.PHASE_DEBUG]:
             self._send_command()
 
         self.control_step += 1
@@ -446,6 +457,22 @@ class Go2VisionController:
                 print("  Press Y to stop and stand")
                 print("  Press L2/R2 for EMERGENCY STOP")
                 print("=" * 60 + "\n")
+
+        # A button: Enter debug mode (from STANDING)
+        if self._check_a_pressed():
+            if self.phase == self.PHASE_STANDING:
+                print("\n[A] Entering DEBUG MODE...")
+                self.phase = self.PHASE_DEBUG
+                self.debug_counter = 0
+                self._reset_walk_state()
+                print("\n" + "=" * 60)
+                print("DEBUG MODE - Printing sensor data, NO motor control")
+                print("  Press Y to exit debug mode")
+                print("=" * 60 + "\n")
+            elif self.phase == self.PHASE_DEBUG:
+                print("\n[A] Exiting debug mode...")
+                self.phase = self.PHASE_STANDING
+                print("\n>>> Press L1 to WALK or A for DEBUG <<<\n")
 
     def _reset_walk_state(self):
         """Reset walking state variables."""
@@ -494,7 +521,126 @@ class Go2VisionController:
 
         # Print reminder occasionally
         if self.control_step % 2500 == 0:  # Every 5 seconds
-            print(">>> Press L1 to WALK or Y to SIT DOWN <<<", end='\r')
+            print(">>> Press L1 to WALK, A for DEBUG, or Y to SIT DOWN <<<", end='\r')
+
+    def _phase_debug(self):
+        """Phase DEBUG: Print all sensor data without controlling motors."""
+        self.debug_counter += 1
+
+        # Only print every 0.5 seconds (250 iterations at 500Hz)
+        if self.debug_counter % 250 != 0:
+            return
+
+        # Get IMU data
+        imu = self.low_state.imu_state
+        quat = imu.quaternion  # [w, x, y, z]
+
+        # Compute roll, pitch, yaw
+        roll = np.arctan2(
+            2 * (quat[0] * quat[1] + quat[2] * quat[3]),
+            1 - 2 * (quat[1]**2 + quat[2]**2)
+        )
+        pitch = np.arcsin(np.clip(
+            2 * (quat[0] * quat[2] - quat[3] * quat[1]),
+            -1, 1
+        ))
+        yaw = np.arctan2(
+            2 * (quat[0] * quat[3] + quat[1] * quat[2]),
+            1 - 2 * (quat[2]**2 + quat[3]**2)
+        )
+
+        # Angular velocity
+        ang_vel = np.array([imu.gyroscope[0], imu.gyroscope[1], imu.gyroscope[2]])
+
+        # Joint positions (SDK order: FR, FL, RR, RL)
+        joint_pos = self._get_joint_positions()
+        joint_vel = self._get_joint_velocities()
+
+        # Foot forces
+        foot_forces = [
+            self.low_state.foot_force[0],  # FR
+            self.low_state.foot_force[1],  # FL
+            self.low_state.foot_force[2],  # RR
+            self.low_state.foot_force[3],  # RL
+        ]
+
+        # Get depth image
+        depth_image = self.camera.get_depth()
+
+        # Build observation and run policy (but don't apply)
+        obs = self._build_observation()
+
+        # Get proprio part (first 53 elements)
+        proprio = obs[:self.config.n_proprio]
+
+        # Run policy to get action (but don't apply)
+        action = self.policy.get_action(depth_image, obs)
+
+        # Print everything
+        print("\n" + "=" * 70)
+        print("DEBUG OUTPUT")
+        print("=" * 70)
+
+        print("\n--- IMU ---")
+        print(f"  Quaternion [w,x,y,z]: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]")
+        print(f"  Roll/Pitch/Yaw (deg): [{np.degrees(roll):.1f}, {np.degrees(pitch):.1f}, {np.degrees(yaw):.1f}]")
+        print(f"  Angular Vel (rad/s):  [{ang_vel[0]:.3f}, {ang_vel[1]:.3f}, {ang_vel[2]:.3f}]")
+
+        print("\n--- Joint Positions (SDK order: FR, FL, RR, RL) ---")
+        print(f"  FR: [{joint_pos[0]:.3f}, {joint_pos[1]:.3f}, {joint_pos[2]:.3f}]")
+        print(f"  FL: [{joint_pos[3]:.3f}, {joint_pos[4]:.3f}, {joint_pos[5]:.3f}]")
+        print(f"  RR: [{joint_pos[6]:.3f}, {joint_pos[7]:.3f}, {joint_pos[8]:.3f}]")
+        print(f"  RL: [{joint_pos[9]:.3f}, {joint_pos[10]:.3f}, {joint_pos[11]:.3f}]")
+
+        print("\n--- Default Joint Angles (SDK order) ---")
+        d = self.config.default_joint_angles
+        print(f"  FR: [{d[0]:.3f}, {d[1]:.3f}, {d[2]:.3f}]")
+        print(f"  FL: [{d[3]:.3f}, {d[4]:.3f}, {d[5]:.3f}]")
+        print(f"  RR: [{d[6]:.3f}, {d[7]:.3f}, {d[8]:.3f}]")
+        print(f"  RL: [{d[9]:.3f}, {d[10]:.3f}, {d[11]:.3f}]")
+
+        print("\n--- Joint Position Error (pos - default) ---")
+        err = joint_pos - self.config.default_joint_angles
+        print(f"  FR: [{err[0]:.3f}, {err[1]:.3f}, {err[2]:.3f}]")
+        print(f"  FL: [{err[3]:.3f}, {err[4]:.3f}, {err[5]:.3f}]")
+        print(f"  RR: [{err[6]:.3f}, {err[7]:.3f}, {err[8]:.3f}]")
+        print(f"  RL: [{err[9]:.3f}, {err[10]:.3f}, {err[11]:.3f}]")
+
+        print("\n--- Foot Forces (FR, FL, RR, RL) ---")
+        print(f"  [{foot_forces[0]:.1f}, {foot_forces[1]:.1f}, {foot_forces[2]:.1f}, {foot_forces[3]:.1f}]")
+
+        print("\n--- Depth Image ---")
+        print(f"  Shape: {depth_image.shape}")
+        print(f"  Min/Max: [{depth_image.min():.3f}, {depth_image.max():.3f}]")
+        print(f"  Mean: {depth_image.mean():.3f}")
+
+        print("\n--- Policy Action Output (unscaled, SDK order) ---")
+        print(f"  FR: [{action[0]:.3f}, {action[1]:.3f}, {action[2]:.3f}]")
+        print(f"  FL: [{action[3]:.3f}, {action[4]:.3f}, {action[5]:.3f}]")
+        print(f"  RR: [{action[6]:.3f}, {action[7]:.3f}, {action[8]:.3f}]")
+        print(f"  RL: [{action[9]:.3f}, {action[10]:.3f}, {action[11]:.3f}]")
+        print(f"  Action range: [{action.min():.3f}, {action.max():.3f}]")
+
+        print("\n--- Proprio Observation (first 53 dims) ---")
+        print(f"  [0:3]   ang_vel*0.25:     [{proprio[0]:.3f}, {proprio[1]:.3f}, {proprio[2]:.3f}]")
+        print(f"  [3:5]   roll,pitch:       [{proprio[3]:.3f}, {proprio[4]:.3f}]")
+        print(f"  [5:8]   yaw stuff:        [{proprio[5]:.3f}, {proprio[6]:.3f}, {proprio[7]:.3f}]")
+        print(f"  [8:11]  cmd stuff:        [{proprio[8]:.3f}, {proprio[9]:.3f}, {proprio[10]:.3f}]")
+        print(f"  [11:13] env_class:        [{proprio[11]:.3f}, {proprio[12]:.3f}]")
+        print(f"  [13:25] dof_pos:          min={proprio[13:25].min():.3f}, max={proprio[13:25].max():.3f}")
+        print(f"  [25:37] dof_vel*0.05:     min={proprio[25:37].min():.3f}, max={proprio[25:37].max():.3f}")
+        print(f"  [37:49] last_action:      min={proprio[37:49].min():.3f}, max={proprio[37:49].max():.3f}")
+        print(f"  [49:53] contacts:         [{proprio[49]:.1f}, {proprio[50]:.1f}, {proprio[51]:.1f}, {proprio[52]:.1f}]")
+
+        print("\n--- Target Position (if walking) ---")
+        target = self.config.default_joint_angles + action * self.config.action_scale
+        print(f"  FR: [{target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f}]")
+        print(f"  FL: [{target[3]:.3f}, {target[4]:.3f}, {target[5]:.3f}]")
+        print(f"  RR: [{target[6]:.3f}, {target[7]:.3f}, {target[8]:.3f}]")
+        print(f"  RL: [{target[9]:.3f}, {target[10]:.3f}, {target[11]:.3f}]")
+
+        print("\n>>> Press A to exit DEBUG, Y to sit down <<<")
+        print("=" * 70)
 
     def _phase_walk(self):
         """Phase WALKING: Run vision policy for walking."""
@@ -538,10 +684,12 @@ class Go2VisionController:
             self.last_action = action
             self.action_history.append(action)
 
-            # Print status
+            # Debug: print action and depth stats every second
             self.walk_startup_counter += 1
             if self.walk_startup_counter % 50 == 0:
-                print(f"  Walking: {self.distance_traveled:.2f}m traveled | Press Y to stop", end='\r')
+                print(f"  Action min/max: {action.min():.2f}/{action.max():.2f} | "
+                      f"Depth min/max: {depth_image.min():.2f}/{depth_image.max():.2f} | "
+                      f"{self.distance_traveled:.2f}m")
 
     def _phase_stand_to_sit(self):
         """Phase STAND_TO_SIT: Safe sit down from standing."""
