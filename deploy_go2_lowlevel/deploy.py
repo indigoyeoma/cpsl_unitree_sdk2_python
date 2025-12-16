@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Go2 Vision Policy Deployment with Safe Sit→Stand→Walk→Sit Sequence
+Go2 Vision Policy Deployment with Button Controls (Parkour-style)
 
-Mission: Walk 2.5 meters forward with vision-based obstacle navigation
+Button Controls:
+    Y      - Stand up (from idle) or exit policy and stand (from walking)
+    L1     - Start walking policy (from standing)
+    L2/R2  - EMERGENCY STOP (from any state)
 
-Sequence:
-1. Camera warmup (3s)
-2. Sit → Stand (smooth transition)
-3. Wait 5 seconds in standing pose
-4. Run vision policy (walk 2.5m forward)
-5. Auto-stop and sit down when complete
-6. Emergency stop: Ctrl+C → safe sit-down
+State Machine:
+    IDLE (damping) --[Y]--> STANDING --[L1]--> WALKING --[Y]--> STANDING
+                                                      |
+                                             [L2/R2] EMERGENCY STOP
 
 Usage:
-    python deploy.py                    # Default: 0.5 m/s, 2.5m mission
-    python deploy.py --command_vx 0.3   # Slower (safer for first test)
-    python deploy.py --command_vx 0.8   # Faster (after confidence)
+    python deploy.py                    # Default: 0.3 m/s
+    python deploy.py --command_vx 0.5   # Faster walking
     python deploy.py --use_dummy_camera # Test without real camera
 """
 
@@ -48,14 +47,43 @@ from policy_jit import JITPolicyRunner
 
 class Go2VisionController:
     """
-    Go2 controller with safe sit→stand→walk→sit sequence.
+    Go2 controller with button-triggered state machine (Parkour-style).
 
-    Phases:
-    - Phase 0 (sit→stand): Smooth transition from sitting to standing (can be skipped)
-    - Phase 1 (hold): Hold standing position for 5 seconds
-    - Phase 2 (walk): Run vision policy
-    - Phase 3 (stand→sit): Safe sit down on shutdown
+    States:
+    - Phase 0 (IDLE): Damping mode, waiting for Y button
+    - Phase 1 (SIT_TO_STAND): Smooth transition from sitting to standing
+    - Phase 2 (STANDING): Hold standing position, waiting for L1
+    - Phase 3 (WALKING): Run vision policy, Y exits to standing
+    - Phase 4 (STAND_TO_SIT): Smooth transition back to sitting
+    - Phase 5 (EMERGENCY): Emergency stop (L2/R2)
+
+    Button Controls:
+    - Y: Stand up (from IDLE) or exit policy (from WALKING)
+    - L1: Start walking policy (from STANDING)
+    - L2/R2: Emergency stop (from any state)
     """
+
+    # Phase constants
+    PHASE_IDLE = 0
+    PHASE_SIT_TO_STAND = 1
+    PHASE_STANDING = 2
+    PHASE_WALKING = 3
+    PHASE_STAND_TO_SIT = 4
+    PHASE_EMERGENCY = 5
+
+    # Button constants (from parkour unitree_ros2_real.py)
+    BUTTON_R1 = 0b00000001
+    BUTTON_L1 = 0b00000010
+    BUTTON_START = 0b00000100
+    BUTTON_SELECT = 0b00001000
+    BUTTON_R2 = 0b00010000
+    BUTTON_L2 = 0b00100000
+    BUTTON_F1 = 0b01000000
+    BUTTON_F2 = 0b10000000
+    BUTTON_A = 0b100000000
+    BUTTON_B = 0b1000000000
+    BUTTON_X = 0b10000000000
+    BUTTON_Y = 0b100000000000
 
     def __init__(self, policy: JITPolicyRunner, camera, config: DeployConfig,
                  skip_standup: bool = False):
@@ -70,6 +98,13 @@ class Go2VisionController:
         self.low_state = None
         self.running = False
         self.shutdown_requested = False
+        self.emergency_stop = False  # L2/R2 emergency stop flag
+        self.torque_clip_enabled = True  # Enable torque clipping for safety
+
+        # Button state (for edge detection)
+        self.prev_buttons = 0
+        self.button_y_pressed = False
+        self.button_l1_pressed = False
 
         # Observation buffers
         self.obs_history = deque(maxlen=config.history_len)
@@ -84,14 +119,12 @@ class Go2VisionController:
         self.delta_yaw = 0.0  # Yaw error to current goal
         self.delta_next_yaw = 0.0  # Yaw error to next goal
 
-        # Distance tracking - walk 2.5 meters
-        self.target_distance_meters = 2.5  # Target: 2.5 meters
-        self.start_position = None  # Will be set when walking starts
-        self.distance_traveled = 0.0  # Distance traveled in meters
-        self.mission_complete = False
+        # Distance tracking
+        self.start_position = None
+        self.distance_traveled = 0.0
 
-        # Phase control (matching go2_stand_example.py pattern)
-        self.phase = 0  # 0=sit→stand, 1=hold, 2=walk, 3=stand→sit
+        # Phase control (button-triggered state machine)
+        self.phase = self.PHASE_IDLE
         self.dt = 0.002  # 500Hz control
 
         # Target positions (SDK joint order: FR, FL, RR, RL)
@@ -112,15 +145,12 @@ class Go2VisionController:
 
         # Phase durations and progress
         self.duration_sit_to_stand = 1000  # 2 seconds @ 500Hz
-        self.duration_hold = 2500          # 5 seconds @ 500Hz
         self.duration_stand_to_sit = 1000  # 2 seconds @ 500Hz
 
         self.percent_sit_to_stand = 0.0
-        self.percent_hold = 0.0
         self.percent_stand_to_sit = 0.0
 
         # Walking phase control
-        self.walk_startup_duration = 500  # 10 seconds @ 50Hz policy
         self.walk_startup_counter = 0
 
         # Timing
@@ -129,14 +159,13 @@ class Go2VisionController:
         self.control_step = 0
 
         print(f"Controller initialized")
-        print(f"  Target distance: {self.target_distance_meters:.2f} meters")
         print(f"  Command velocity: {self.config.command_vx} m/s")
-        if skip_standup:
-            print(f"  Mode: Skip standup (start in standing pose like simulator)")
-        else:
-            print(f"  Sit→Stand: {self.duration_sit_to_stand * self.dt:.1f}s")
-        print(f"  Hold: {self.duration_hold * self.dt:.1f}s")
-        print(f"  Stand→Sit: {self.duration_stand_to_sit * self.dt:.1f}s")
+        print(f"  Sit→Stand duration: {self.duration_sit_to_stand * self.dt:.1f}s")
+        print(f"  Stand→Sit duration: {self.duration_stand_to_sit * self.dt:.1f}s")
+        print(f"\nButton Controls:")
+        print(f"  Y     - Stand up / Exit policy")
+        print(f"  L1    - Start walking policy")
+        print(f"  L2/R2 - EMERGENCY STOP")
 
     def init(self):
         """Initialize SDK channels."""
@@ -202,17 +231,17 @@ class Go2VisionController:
 
         # Start phase depends on skip_standup flag
         if self.skip_standup:
-            self.phase = 1  # Skip sit→stand, start with hold
-            self.start_pos = self._stand_pos.copy()  # Start from standing pose
-            self.first_run = False  # Don't capture start position
+            self.phase = self.PHASE_STANDING  # Skip to standing
+            self.start_pos = self._stand_pos.copy()
+            self.first_run = False
             print("\n✓ Starting in standing pose (like simulator)")
         else:
-            self.phase = 0  # Start with sit→stand
+            self.phase = self.PHASE_IDLE  # Start in idle, waiting for Y
 
         # Start camera
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 60)
         print("Starting Camera")
-        print("=" * 70)
+        print("=" * 60)
         self.camera.start()
         print("✓ Camera started")
 
@@ -238,8 +267,11 @@ class Go2VisionController:
         if not self.shutdown_requested:
             print("\n\n⚠️  Shutdown requested - returning to sit position...")
             self.shutdown_requested = True
-            self.phase = 3  # Jump to stand→sit phase
-            self.percent_stand_to_sit = 0.0
+            if self.phase in [self.PHASE_STANDING, self.PHASE_WALKING]:
+                self.phase = self.PHASE_STAND_TO_SIT
+                self.percent_stand_to_sit = 0.0
+            else:
+                self.running = False
 
     def stop(self):
         """Stop the control loop."""
@@ -261,9 +293,74 @@ class Go2VisionController:
         self.camera.stop()
         print("✓ Control stopped")
 
+    def _get_button_state(self):
+        """Get current button state from wireless remote (parkour-style)."""
+        if self.low_state is None:
+            return 0
+
+        # wireless_remote is a bytes array, parse as 16-bit button mask
+        # Based on parkour unitree_ros2_real.py WirelessButtons
+        wireless_remote = self.low_state.wireless_remote
+        # Combine bytes to get full button state
+        buttons = wireless_remote[0] | (wireless_remote[1] << 8)
+        return buttons
+
+    def _check_button_pressed(self, button_mask):
+        """Check if button was just pressed (edge detection)."""
+        buttons = self._get_button_state()
+        # Rising edge: button is pressed now but wasn't before
+        pressed = (buttons & button_mask) and not (self.prev_buttons & button_mask)
+        return pressed
+
+    def _update_button_state(self):
+        """Update previous button state for edge detection."""
+        self.prev_buttons = self._get_button_state()
+
+    def _check_emergency_stop(self):
+        """Check L2/R2 buttons for emergency stop (from parkour)."""
+        buttons = self._get_button_state()
+        return (buttons & self.BUTTON_L2) or (buttons & self.BUTTON_R2)
+
+    def _check_y_pressed(self):
+        """Check if Y button was just pressed."""
+        return self._check_button_pressed(self.BUTTON_Y)
+
+    def _check_l1_pressed(self):
+        """Check if L1 button was just pressed."""
+        return self._check_button_pressed(self.BUTTON_L1)
+
+    def _emergency_motor_shutdown(self):
+        """Immediately disable all motors (from parkour)."""
+        print("\n" + "!" * 70)
+        print("!!! EMERGENCY STOP - L2/R2 PRESSED !!!")
+        print("!" * 70)
+
+        # Send damping mode command to all motors
+        for i in range(12):
+            self.low_cmd.motor_cmd[i].mode = 0x00  # Disable motor
+            self.low_cmd.motor_cmd[i].q = 0
+            self.low_cmd.motor_cmd[i].dq = 0
+            self.low_cmd.motor_cmd[i].kp = 0
+            self.low_cmd.motor_cmd[i].kd = 3.0  # Some damping for soft landing
+            self.low_cmd.motor_cmd[i].tau = 0
+
+        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+        self.lowcmd_publisher.Write(self.low_cmd)
+
+        self.emergency_stop = True
+        self.phase = self.PHASE_EMERGENCY
+        self.running = False
+        print("Motors disabled. Robot should go limp.")
+        print("CATCH THE ROBOT if needed!")
+
     def _control_loop(self):
         """Main control loop running at 500Hz."""
         if not self.running or self.low_state is None:
+            return
+
+        # Check for emergency stop (L2/R2) - highest priority
+        if self._check_emergency_stop():
+            self._emergency_motor_shutdown()
             return
 
         # Capture start position on first run
@@ -271,24 +368,95 @@ class Go2VisionController:
             self.start_pos = self._get_joint_positions()
             self.first_run = False
             print(f"\n✓ Captured start position")
+            self._print_controls()
+
+        # Handle button inputs based on current phase
+        self._handle_button_inputs()
 
         # Execute current phase
-        if self.phase == 0:
+        if self.phase == self.PHASE_IDLE:
+            self._phase_idle()
+        elif self.phase == self.PHASE_SIT_TO_STAND:
             self._phase_sit_to_stand()
-        elif self.phase == 1:
-            self._phase_hold_stand()
-        elif self.phase == 2:
+        elif self.phase == self.PHASE_STANDING:
+            self._phase_standing()
+        elif self.phase == self.PHASE_WALKING:
             self._phase_walk()
-        elif self.phase == 3:
+        elif self.phase == self.PHASE_STAND_TO_SIT:
             self._phase_stand_to_sit()
+        elif self.phase == self.PHASE_EMERGENCY:
+            pass  # Motors already disabled
 
-        # Send motor commands
-        self._send_command()
+        # Update button state for edge detection
+        self._update_button_state()
+
+        # Send motor commands (except in IDLE and EMERGENCY)
+        if self.phase not in [self.PHASE_IDLE, self.PHASE_EMERGENCY]:
+            self._send_command()
 
         self.control_step += 1
 
+    def _print_controls(self):
+        """Print control instructions."""
+        print("\n" + "=" * 60)
+        print("BUTTON CONTROLS:")
+        print("  Y     - Stand up / Exit policy and stand")
+        print("  L1    - Start walking policy (from standing)")
+        print("  L2/R2 - EMERGENCY STOP")
+        print("=" * 60)
+        print("\n>>> Press Y to STAND UP <<<\n")
+
+    def _handle_button_inputs(self):
+        """Handle button inputs for state transitions."""
+        # Y button: Stand up (from IDLE) or exit policy (from WALKING)
+        if self._check_y_pressed():
+            if self.phase == self.PHASE_IDLE:
+                print("\n[Y] Standing up...")
+                self.phase = self.PHASE_SIT_TO_STAND
+                self.percent_sit_to_stand = 0.0
+            elif self.phase == self.PHASE_WALKING:
+                print("\n[Y] Exiting policy, returning to standing...")
+                self.phase = self.PHASE_STANDING
+                self._reset_walk_state()
+                print("\n>>> Press L1 to WALK or Y to SIT DOWN <<<\n")
+            elif self.phase == self.PHASE_STANDING:
+                print("\n[Y] Sitting down...")
+                self.phase = self.PHASE_STAND_TO_SIT
+                self.percent_stand_to_sit = 0.0
+
+        # L1 button: Start walking (from STANDING)
+        if self._check_l1_pressed():
+            if self.phase == self.PHASE_STANDING:
+                print("\n[L1] Starting walking policy...")
+                self.phase = self.PHASE_WALKING
+                self.walk_startup_counter = 0
+                self.last_policy_time = time.time()
+                self._reset_walk_state()
+                print("\n" + "=" * 60)
+                print(f"WALKING MODE - Velocity: {self.config.command_vx} m/s")
+                print("  Press Y to stop and stand")
+                print("  Press L2/R2 for EMERGENCY STOP")
+                print("=" * 60 + "\n")
+
+    def _reset_walk_state(self):
+        """Reset walking state variables."""
+        self.obs_history.clear()
+        self.action_history.clear()
+        self.last_action = np.zeros(12, dtype=np.float32)
+        self.start_position = None
+        self.distance_traveled = 0.0
+        self.robot_position = np.zeros(2, dtype=np.float32)
+        self.robot_yaw = 0.0
+
+    def _phase_idle(self):
+        """Phase IDLE: Damping mode, waiting for Y button."""
+        # Just hold in damping - don't send active commands
+        # Print reminder occasionally
+        if self.control_step % 2500 == 0:  # Every 5 seconds
+            print(">>> Press Y to STAND UP <<<", end='\r')
+
     def _phase_sit_to_stand(self):
-        """Phase 0: Smooth transition from sitting to standing."""
+        """Phase SIT_TO_STAND: Smooth transition from sitting to standing."""
         self.percent_sit_to_stand += 1.0 / self.duration_sit_to_stand
         self.percent_sit_to_stand = min(self.percent_sit_to_stand, 1.0)
 
@@ -303,61 +471,32 @@ class Go2VisionController:
             progress = int(self.percent_sit_to_stand * 100)
             print(f"  Sit→Stand: {progress}%", end='\r')
 
-        # Move to next phase when complete
+        # Move to STANDING phase when complete
         if self.percent_sit_to_stand >= 1.0:
             print(f"  Sit→Stand: 100% ✓" + " " * 20)
-            self.phase = 1
-            self.percent_hold = 0.0
+            self.phase = self.PHASE_STANDING
             print("\n✓ Standing pose reached")
-            print(f"\nHolding position for {self.duration_hold * self.dt:.0f} seconds...")
+            print("\n>>> Press L1 to WALK or Y to SIT DOWN <<<\n")
 
-    def _phase_hold_stand(self):
-        """Phase 1: Hold standing position."""
-        self.percent_hold += 1.0 / self.duration_hold
-        self.percent_hold = min(self.percent_hold, 1.0)
-
+    def _phase_standing(self):
+        """Phase STANDING: Hold standing position, waiting for L1."""
         # Hold standing position
         self.target_positions = self._stand_pos.copy()
 
-        # Print countdown
-        if self.control_step % 500 == 0:  # Every 1s
-            remaining = (1.0 - self.percent_hold) * self.duration_hold * self.dt
-            print(f"  Holding: {remaining:.1f}s remaining", end='\r')
-
-        # Move to walk phase when complete
-        if self.percent_hold >= 1.0:
-            print(f"  Holding: Complete ✓" + " " * 30)
-            self.phase = 2
-            self.walk_startup_counter = 0
-            self.last_policy_time = time.time()
-            print("\n" + "=" * 70)
-            print(f"Starting Vision Policy (target: {self.config.command_vx} m/s)")
-            print("=" * 70)
-            print("Press Ctrl+C to stop and sit down safely\n")
+        # Print reminder occasionally
+        if self.control_step % 2500 == 0:  # Every 5 seconds
+            print(">>> Press L1 to WALK or Y to SIT DOWN <<<", end='\r')
 
     def _phase_walk(self):
-        """Phase 2: Run vision policy for walking."""
+        """Phase WALKING: Run vision policy for walking."""
         current_time = time.time()
 
         # Set start position on first walk iteration
         if self.start_position is None:
             self.start_position = self.robot_position.copy()
-            print(f"\n  Starting position: ({self.start_position[0]:.3f}, {self.start_position[1]:.3f})")
-            print(f"  Walking 2.5 meters forward...\n")
 
         # Update distance traveled
         self.distance_traveled = np.linalg.norm(self.robot_position - self.start_position)
-
-        # Check if target distance reached
-        if self.distance_traveled >= self.target_distance_meters and not self.mission_complete:
-            self.mission_complete = True
-            print(f"\n{'='*70}")
-            print(f"✓ Target distance reached: {self.distance_traveled:.2f}m / {self.target_distance_meters:.2f}m")
-            print(f"{'='*70}\n")
-            print("Transitioning to sit down...")
-            self.phase = 3  # Move to stand→sit phase
-            self.percent_stand_to_sit = 0.0
-            return
 
         # Run policy at 50Hz
         if current_time - self.last_policy_time >= self.policy_dt:
@@ -387,16 +526,13 @@ class Go2VisionController:
             self.last_action = action
             self.action_history.append(action)
 
-            # Print status with distance progress
+            # Print status
             self.walk_startup_counter += 1
             if self.walk_startup_counter % 50 == 0:
-                # Show distance progress every second
-                percent_complete = (self.distance_traveled / self.target_distance_meters) * 100
-                remaining = self.target_distance_meters - self.distance_traveled
-                print(f"  Distance: {self.distance_traveled:.2f}m / {self.target_distance_meters:.2f}m ({percent_complete:.0f}%) - {remaining:.2f}m remaining", end='\r')
+                print(f"  Walking: {self.distance_traveled:.2f}m traveled | Press Y to stop", end='\r')
 
     def _phase_stand_to_sit(self):
-        """Phase 3: Safe sit down from standing."""
+        """Phase STAND_TO_SIT: Safe sit down from standing."""
         self.percent_stand_to_sit += 1.0 / self.duration_stand_to_sit
         self.percent_stand_to_sit = min(self.percent_stand_to_sit, 1.0)
 
@@ -411,14 +547,17 @@ class Go2VisionController:
             progress = int(self.percent_stand_to_sit * 100)
             print(f"  Stand→Sit: {progress}%", end='\r')
 
-        # Stop when complete
+        # Return to IDLE when complete
         if self.percent_stand_to_sit >= 1.0:
             print(f"  Stand→Sit: 100% ✓" + " " * 20)
-            print("\n✓ Sit position reached - safe to power off")
-            self.running = False
+            print("\n✓ Sit position reached")
+            self.phase = self.PHASE_IDLE
+            # Update start position for next stand-up
+            self.start_pos = self._get_joint_positions()
+            print("\n>>> Press Y to STAND UP again <<<\n")
 
     def _send_command(self):
-        """Send low-level motor commands."""
+        """Send low-level motor commands with torque clipping (from parkour)."""
         if not hasattr(self, 'target_positions'):
             return
 
@@ -431,8 +570,19 @@ class Go2VisionController:
             kp = self.config.kp_walk   # 25.0 (training gains)
             kd = self.config.kd_walk   # 0.6
 
+        # Get current state for torque clipping
+        target_pos = self.target_positions.copy()
+
+        # Apply torque clipping during walking phase (phase 2) to prevent motor damage
+        if self.torque_clip_enabled and self.phase == 2:
+            current_pos = self._get_joint_positions()
+            current_vel = self._get_joint_velocities()
+            target_pos = JointLimits.clip_by_torque_limit(
+                target_pos, current_pos, current_vel, kp, kd
+            )
+
         for i in range(12):
-            self.low_cmd.motor_cmd[i].q = float(self.target_positions[i])
+            self.low_cmd.motor_cmd[i].q = float(target_pos[i])
             self.low_cmd.motor_cmd[i].dq = 0
             self.low_cmd.motor_cmd[i].kp = kp
             self.low_cmd.motor_cmd[i].kd = kd
@@ -551,10 +701,12 @@ class Go2VisionController:
             contacts,                       # 4
         ]).astype(np.float32)
 
-        # Update history
-        self.obs_history.append(proprio.copy())
+        # Update history (mask yaw before appending, matching training!)
+        proprio_for_history = proprio.copy()
+        proprio_for_history[6:8] = 0  # Mask delta_yaw and delta_next_yaw in history
+        self.obs_history.append(proprio_for_history)
         while len(self.obs_history) < self.config.history_len:
-            self.obs_history.appendleft(proprio.copy())
+            self.obs_history.appendleft(proprio_for_history.copy())
 
         history = np.concatenate(list(self.obs_history))
 
@@ -632,6 +784,10 @@ def main():
                         help='Network interface for DDS')
     parser.add_argument('--skip_standup', action='store_true',
                         help='Skip sit-to-stand transition, start in standing pose (like simulator)')
+    parser.add_argument('--rotate_camera', action='store_true',
+                        help='Rotate camera 180 degrees (for inverted mounting like parkour)')
+    parser.add_argument('--no_torque_clip', action='store_true',
+                        help='Disable torque clipping (not recommended)')
     args = parser.parse_args()
 
     # Find models
@@ -685,7 +841,10 @@ def main():
         target_height=DeployConfig.depth_height,
         near_clip=DeployConfig.depth_near,
         far_clip=DeployConfig.depth_far,
+        rotate_180=args.rotate_camera,  # For inverted camera mounting
     )
+    if args.rotate_camera:
+        print("✓ Camera rotation enabled (180°)")
 
     # Setup config
     config = DeployConfig()
@@ -693,6 +852,11 @@ def main():
 
     # Create controller
     controller = Go2VisionController(policy, camera, config, skip_standup=args.skip_standup)
+
+    # Disable torque clipping if requested (not recommended!)
+    if args.no_torque_clip:
+        controller.torque_clip_enabled = False
+        print("⚠️  WARNING: Torque clipping disabled - motor damage possible!")
 
     # Setup signal handler for safe shutdown
     def signal_handler(sig, frame):

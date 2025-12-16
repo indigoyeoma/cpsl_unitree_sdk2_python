@@ -32,6 +32,7 @@ class D435iCamera:
         target_height: int = 58,
         near_clip: float = 0.0,
         far_clip: float = 2.0,
+        rotate_180: bool = False,  # Set True if camera is mounted inverted (like parkour)
     ):
         """
         Initialize D435i camera.
@@ -44,6 +45,7 @@ class D435iCamera:
             target_height: Output height for policy (after resize)
             near_clip: Minimum depth in meters
             far_clip: Maximum depth in meters
+            rotate_180: Rotate image 180 degrees (for inverted camera mounting)
         """
         self.width = width
         self.height = height
@@ -52,6 +54,7 @@ class D435iCamera:
         self.target_height = target_height
         self.near_clip = near_clip
         self.far_clip = far_clip
+        self.rotate_180 = rotate_180
 
         self.pipeline = None
         self.config = None
@@ -95,6 +98,26 @@ class D435iCamera:
         except Exception as e:
             print(f"Could not set visual preset: {e}")
 
+        # Build RealSense filters (from parkour go2_visual.py)
+        # These improve depth quality significantly
+        self.rs_hole_filling_filter = rs.hole_filling_filter()
+        self.rs_spatial_filter = rs.spatial_filter()
+        self.rs_spatial_filter.set_option(rs.option.filter_magnitude, 5)
+        self.rs_spatial_filter.set_option(rs.option.filter_smooth_alpha, 0.75)
+        self.rs_spatial_filter.set_option(rs.option.filter_smooth_delta, 1)
+        self.rs_spatial_filter.set_option(rs.option.holes_fill, 4)
+        self.rs_temporal_filter = rs.temporal_filter()
+        self.rs_temporal_filter.set_option(rs.option.filter_smooth_alpha, 0.75)
+        self.rs_temporal_filter.set_option(rs.option.filter_smooth_delta, 1)
+
+        # Filter pipeline order (from parkour)
+        self.rs_filters = [
+            self.rs_hole_filling_filter,
+            self.rs_spatial_filter,
+            self.rs_temporal_filter,
+        ]
+        print(f"✓ RealSense filters enabled (hole filling, spatial, temporal)")
+
         self.running = True
 
         # Start background capture thread
@@ -111,6 +134,10 @@ class D435iCamera:
                 depth_frame = frames.get_depth_frame()
 
                 if depth_frame:
+                    # Apply RealSense filters (from parkour)
+                    for rs_filter in self.rs_filters:
+                        depth_frame = rs_filter.process(depth_frame)
+
                     depth_image = self._process_depth_frame(depth_frame)
                     with self.latest_depth_lock:
                         self.latest_depth = depth_image
@@ -134,6 +161,10 @@ class D435iCamera:
         """
         # Convert to numpy array (in millimeters for z16)
         depth_image = np.asanyarray(depth_frame.get_data()).astype(np.float32)
+
+        # Rotate 180 degrees if camera is mounted inverted (from parkour)
+        if self.rotate_180:
+            depth_image = np.rot90(depth_image, k=2)  # k=2 for 180 degree rotation
 
         # Convert to meters (negative as in Isaac Gym depth)
         depth_image = -depth_image * self.depth_scale
@@ -226,6 +257,7 @@ def create_camera(use_real: bool = True, **kwargs):
     Args:
         use_real: If True, try to use real D435i camera
         **kwargs: Additional arguments for camera initialization
+            - rotate_180: Set True if camera is mounted inverted (like parkour Go2 setup)
 
     Returns:
         Camera instance (D435iCamera or DummyCamera)

@@ -108,6 +108,15 @@ class JointLimits:
     calf_min = -2.7     # ~-155 deg
     calf_max = -0.83    # ~-48 deg
 
+    # Torque limits per joint type (Nm) - from Go2 specs
+    # Order: FR, FL, RR, RL (SDK order)
+    torque_limits = np.array([
+        25.0, 40.0, 40.0,  # FR: hip, thigh, calf
+        25.0, 40.0, 40.0,  # FL
+        25.0, 40.0, 40.0,  # RR
+        25.0, 40.0, 40.0,  # RL
+    ], dtype=np.float32)
+
     @staticmethod
     def clip_joints(joints):
         """Clip joint angles to safe limits"""
@@ -117,6 +126,46 @@ class JointLimits:
             clipped[base] = np.clip(joints[base], JointLimits.hip_min, JointLimits.hip_max)
             clipped[base+1] = np.clip(joints[base+1], JointLimits.thigh_min, JointLimits.thigh_max)
             clipped[base+2] = np.clip(joints[base+2], JointLimits.calf_min, JointLimits.calf_max)
+        return clipped
+
+    @staticmethod
+    def clip_by_torque_limit(target_pos, current_pos, current_vel, kp, kd, torque_limits=None):
+        """
+        Clip target positions based on torque limits (from parkour).
+
+        Prevents commanding positions that would require excessive torque.
+        Uses inverse PD equation: torque = kp * (target - current) - kd * vel
+
+        Args:
+            target_pos: Target joint positions (12,)
+            current_pos: Current joint positions (12,)
+            current_vel: Current joint velocities (12,)
+            kp: Position gain
+            kd: Damping gain
+            torque_limits: Max torque per joint (12,), uses default if None
+
+        Returns:
+            Clipped target positions
+        """
+        if torque_limits is None:
+            torque_limits = JointLimits.torque_limits
+
+        # Compute position limits based on torque limits
+        # From: tau = kp * (target - current) - kd * vel
+        # Solve for target: target = current + (tau + kd * vel) / kp
+        pos_delta_max = (torque_limits + kd * current_vel) / kp
+        pos_delta_min = (-torque_limits + kd * current_vel) / kp
+
+        # Compute allowed position range
+        pos_max = current_pos + pos_delta_max
+        pos_min = current_pos + pos_delta_min
+
+        # Ensure min < max
+        pos_min_final = np.minimum(pos_min, pos_max)
+        pos_max_final = np.maximum(pos_min, pos_max)
+
+        # Clip target positions
+        clipped = np.clip(target_pos, pos_min_final, pos_max_final)
         return clipped
 
 
