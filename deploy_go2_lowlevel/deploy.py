@@ -1018,8 +1018,8 @@ class Go2VisionController:
     def _update_goals_and_yaw(self):
         """Update goals and compute delta_yaw for straight-line walking.
 
-        Goal direction is FIXED at initial heading (yaw at start of walking).
-        This gives the policy a yaw error signal when the robot drifts.
+        Goals are on a FIXED LINE along the initial heading (X axis when robot started).
+        If robot drifts left/right, delta_yaw will cause it to correct back to the line.
         """
         # Get current robot yaw from IMU
         imu = self.low_state.imu_state
@@ -1031,10 +1031,10 @@ class Go2VisionController:
             1 - 2 * (quat[2]**2 + quat[3]**2)
         )
 
-        # Set initial heading on first call (reference direction for walking)
+        # Set initial heading on first call (this defines the "X axis" for walking)
         if not hasattr(self, 'initial_heading'):
             self.initial_heading = self.robot_yaw
-            print(f"[NAV] Initial heading set to {np.degrees(self.initial_heading):.1f}°")
+            print(f"[NAV] Initial heading (fixed goal line): {np.degrees(self.initial_heading):.1f}°")
 
         # Update robot position by integrating velocity in world frame
         dt = self.policy_dt
@@ -1044,17 +1044,18 @@ class Go2VisionController:
         dy = vel_forward * np.sin(self.robot_yaw) * dt
         self.robot_position += np.array([dx, dy], dtype=np.float32)
 
-        # Goal direction is FIXED along initial heading (not rotating with robot!)
+        # Goals are on a FIXED LINE along initial heading
+        # This line doesn't rotate with the robot - it stays fixed in world frame
         fixed_forward_dir = np.array([np.cos(self.initial_heading), np.sin(self.initial_heading)])
 
-        # Project robot position onto initial heading axis to get forward progress
+        # Project robot position onto the fixed line to get forward progress
         forward_progress = np.dot(self.robot_position, fixed_forward_dir)
 
-        # Place goal ahead along fixed direction
+        # Place goals along the fixed line, ahead of the robot's progress
         self.current_goal = fixed_forward_dir * (forward_progress + self.config.goal_distance)
         self.next_goal = fixed_forward_dir * (forward_progress + self.config.next_goal_distance)
 
-        # Compute target yaw (direction from robot to goal)
+        # Compute target yaw (direction from robot to goal on the fixed line)
         target_pos_rel = self.current_goal - self.robot_position
         next_target_pos_rel = self.next_goal - self.robot_position
 
@@ -1064,7 +1065,9 @@ class Go2VisionController:
         norm_next = np.linalg.norm(next_target_pos_rel) + 1e-5
         next_target_yaw = np.arctan2(next_target_pos_rel[1] / norm_next, next_target_pos_rel[0] / norm_next)
 
-        # Compute delta yaw (yaw error to goal) - now NON-ZERO when robot drifts!
+        # Compute delta yaw - NON-ZERO when robot drifts off the line!
+        # Positive delta_yaw = goal is to the left, robot should turn left
+        # Negative delta_yaw = goal is to the right, robot should turn right
         self.delta_yaw = target_yaw - self.robot_yaw
         self.delta_next_yaw = next_target_yaw - self.robot_yaw
 
@@ -1072,9 +1075,28 @@ class Go2VisionController:
         self.delta_yaw = np.arctan2(np.sin(self.delta_yaw), np.cos(self.delta_yaw))
         self.delta_next_yaw = np.arctan2(np.sin(self.delta_next_yaw), np.cos(self.delta_next_yaw))
 
+    def _update_distance(self):
+        """Update estimated distance traveled (simple integration)."""
+        # Get current robot yaw from IMU
+        imu = self.low_state.imu_state
+        quat = imu.quaternion  # [w, x, y, z]
+        self.robot_yaw = np.arctan2(
+            2 * (quat[0] * quat[3] + quat[1] * quat[2]),
+            1 - 2 * (quat[2]**2 + quat[3]**2)
+        )
+
+        # Estimate forward progress based on commanded velocity
+        # This is approximate - real odometry would be better
+        dt = self.policy_dt
+        vel_forward = self.config.command_vx * 0.8  # ~80% efficiency estimate
+
+        dx = vel_forward * np.cos(self.robot_yaw) * dt
+        dy = vel_forward * np.sin(self.robot_yaw) * dt
+        self.robot_position += np.array([dx, dy], dtype=np.float32)
+
     def _build_observation(self) -> np.ndarray:
         """Build observation vector from real sensors."""
-        # Update goals and compute delta_yaw (matching training)
+        # Update goals and delta_yaw (goals always ahead of robot)
         self._update_goals_and_yaw()
 
         # Get IMU data
@@ -1088,7 +1110,7 @@ class Go2VisionController:
             -1, 1
         ))
 
-        # Angular velocity
+        # Angular velocity (from IMU gyroscope - already in body frame)
         ang_vel = np.array([imu.gyroscope[0], imu.gyroscope[1], imu.gyroscope[2]])
 
         # Joint states (SDK order = FR,FL,RR,RL = training observation order after reindex)
@@ -1121,10 +1143,10 @@ class Go2VisionController:
             ang_vel * ang_vel_scale,       # 3  [0:3]
             [roll, pitch],                  # 2  [3:5]
             [0.0],                          # 0*delta_yaw (masked) [5]
-            [self.delta_yaw],               # delta_yaw [6]
-            [self.delta_next_yaw],          # delta_next_yaw [7]
+            [self.delta_yaw],               # delta_yaw [6] = 0 (walk straight)
+            [self.delta_next_yaw],          # delta_next_yaw [7] = 0
             [0.0, 0.0],                     # 0*commands[:2] (MASKED vx,vy) [8:10]
-            [self.config.command_vx],       # commands[0:1] = vx [10] - THIS IS THE ACTUAL COMMAND!
+            [self.config.command_vx],       # commands[0:1] = vx [10] - forward velocity
             [1.0, 0.0],                     # env_class flags [11:13]
             dof_pos * dof_pos_scale,        # 12 [13:25]
             joint_vel * dof_vel_scale,      # 12 [25:37] (SDK order = observation order)
