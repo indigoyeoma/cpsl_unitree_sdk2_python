@@ -573,9 +573,14 @@ class Go2VisionController:
         if not hasattr(self, 'target_positions'):
             return
 
-        # Use training gains for ALL phases (like parkour does)
-        kp = self.config.kp_walk   # 25.0 (training gains)
-        kd = self.config.kd_walk   # 0.6
+        # Use training gains ONLY for walking (must match sim2real)
+        # Use strong gains for standing/transitions (need stiffness to hold position)
+        if self.phase == self.PHASE_WALKING:
+            kp = self.config.kp_walk   # 25.0 (training gains)
+            kd = self.config.kd_walk   # 0.6
+        else:
+            kp = self.config.kp_stand  # 70.0 (strong for standing)
+            kd = self.config.kd_stand  # 3.0
 
         # Get current state for torque clipping
         target_pos = self.target_positions.copy()
