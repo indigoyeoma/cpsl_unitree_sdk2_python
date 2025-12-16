@@ -80,12 +80,12 @@ class DeployConfig:
     # SDK expects: [FR_*, FL_*, RR_*, RL_*]
 
     # Depth camera config (D435i on Go2 head - must match training)
-    # From go2_config.py: resized=(87,58), fov=87, near=0.3, far=3.0
+    # D435i minimum reliable depth is ~0.3m
     depth_width = 87
     depth_height = 58
-    depth_fov = 87  # horizontal FOV in degrees (matches training)
-    depth_near = 0.3  # D435i minimum depth (matches training)
-    depth_far = 3.0   # D435i maximum depth (matches training)
+    depth_fov = 86  # horizontal FOV in degrees (D435i spec)
+    depth_near = 0.3  # D435i minimum reliable depth
+    depth_far = 3.0   # Maximum depth range
     depth_scale = 1.0
 
     # Observation dimensions (must match training)
