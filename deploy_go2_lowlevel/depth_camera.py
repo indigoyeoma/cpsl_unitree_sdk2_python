@@ -33,9 +33,10 @@ class D435iCamera:
         near_clip: float = 0.3,
         far_clip: float = 3.0,
         rotate_180: bool = False,  # Set True if camera is mounted inverted
-        # Cropping settings (matching parkour go2_visual.py EXACTLY)
-        # Parkour uses 640x480 with crop_top=48, crop_left=28, crop_right=36, crop_bottom=0
-        crop_left: int = 28,    # Exact parkour value
+        # Cropping settings - MORE aggressive left crop to remove D435i edge artifact
+        # Parkour uses crop_left=28 but our D435i has artifact extending to cols 0-3 after resize
+        # Increase left crop to remove ~5% more (640 * 0.09 ≈ 58)
+        crop_left: int = 58,    # Increased from 28 to remove left edge artifact
         crop_right: int = 36,   # Exact parkour value
         crop_top: int = 48,     # Exact parkour value
         crop_bottom: int = 0,   # Exact parkour value
@@ -271,8 +272,14 @@ class DummyCamera:
         print("Dummy camera started")
 
     def get_depth(self) -> np.ndarray:
-        # Return flat ground at 1.0m
-        return np.ones((self.target_height, self.target_width), dtype=np.float32) * 0.5
+        # Return realistic depth: floor at bottom, far at top
+        # Simulates looking forward and down at flat ground
+        depth = np.zeros((self.target_height, self.target_width), dtype=np.float32)
+        for row in range(self.target_height):
+            # Top rows = far (+0.3), bottom rows = close (-0.4 = floor at ~0.5m)
+            t = row / (self.target_height - 1)  # 0 at top, 1 at bottom
+            depth[row, :] = 0.3 - 0.7 * t  # +0.3 at top, -0.4 at bottom
+        return depth
 
     def stop(self):
         self.running = False

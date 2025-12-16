@@ -1049,6 +1049,19 @@ class Go2VisionController:
                 np.save("depth_image_sample.npy", depth_image)
                 f.write(f"  [Saved full depth to: depth_image_sample.npy]\n")
 
+            # ===== DEPTH LATENT DEBUG =====
+            debug_info = self.policy.get_debug_info()
+            if debug_info['depth_latent'] is not None:
+                dl = debug_info['depth_latent']
+                yaw_pred = debug_info['yaw_pred']
+                f.write(f"\n--- Depth Encoder Output ---\n")
+                f.write(f"  Depth latent (32-dim): min={dl.min():.3f}, max={dl.max():.3f}, mean={dl.mean():.3f}, std={dl.std():.3f}\n")
+                f.write(f"  Yaw prediction (2-dim): [{yaw_pred[0]:.4f}, {yaw_pred[1]:.4f}]\n")
+                f.write(f"  Yaw pred scaled (1.5x): [{1.5*yaw_pred[0]:.4f}, {1.5*yaw_pred[1]:.4f}]\n")
+                # Check if depth latent is in expected range (tanh output should be [-1, 1])
+                if abs(dl.max()) > 1.0 or abs(dl.min()) > 1.0:
+                    f.write(f"  ⚠️ DEPTH LATENT OUT OF RANGE! (expected [-1, 1] from tanh)\n")
+
             # ===== ACTION (SDK order - no conversion needed) =====
             f.write(f"\n--- Raw Action (SDK order: FR,FL,RR,RL) - sent to motors via torque clip ---\n")
             f.write(f"  FR: [{action_raw[0]:.4f}, {action_raw[1]:.4f}, {action_raw[2]:.4f}]\n")

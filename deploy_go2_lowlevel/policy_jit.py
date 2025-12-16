@@ -199,6 +199,10 @@ class JITPolicyRunner:
         depth_latent = depth_latent_and_yaw[:, :-2]  # [32]
         yaw = depth_latent_and_yaw[:, -2:]           # [2]
 
+        # Store for debugging
+        self._last_depth_latent = depth_latent.cpu().numpy().flatten()
+        self._last_yaw_pred = yaw.cpu().numpy().flatten()
+
         # Update observation with predicted yaw (scaled by 1.5 as in training)
         obs_tensor[:, 6:8] = 1.5 * yaw
 
@@ -207,6 +211,13 @@ class JITPolicyRunner:
         actions = self.policy_jit(obs_tensor, depth_latent)
 
         return actions.cpu().numpy().flatten()
+
+    def get_debug_info(self):
+        """Return last depth latent and yaw prediction for debugging."""
+        return {
+            'depth_latent': getattr(self, '_last_depth_latent', None),
+            'yaw_pred': getattr(self, '_last_yaw_pred', None),
+        }
 
 
 def load_jit_policy(traced_dir: str, exptid: str, checkpoint: str, device: str = "cuda"):
