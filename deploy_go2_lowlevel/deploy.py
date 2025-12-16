@@ -5,6 +5,8 @@ Go2 Vision Policy Deployment with Button Controls (Parkour-style)
 Button Controls:
     Y      - Stand up (from idle) or exit policy and stand (from walking)
     L1     - Start walking policy (from standing)
+    A      - DEBUG MODE (full sensor printout)
+    B      - Quick depth + IMU snapshot
     L2/R2  - EMERGENCY STOP (from any state)
 
 State Machine:
@@ -60,6 +62,8 @@ class Go2VisionController:
     Button Controls:
     - Y: Stand up (from IDLE) or exit policy (from WALKING)
     - L1: Start walking policy (from STANDING)
+    - A: DEBUG MODE (full sensor printout)
+    - B: Quick depth + IMU snapshot
     - L2/R2: Emergency stop (from any state)
     """
 
@@ -174,6 +178,7 @@ class Go2VisionController:
         print(f"  Y     - Stand up / Exit policy")
         print(f"  L1    - Start walking policy")
         print(f"  A     - DEBUG MODE (print sensors, no motor control)")
+        print(f"  B     - Quick depth + IMU snapshot")
         print(f"  L2/R2 - EMERGENCY STOP")
 
         # Debug mode counter
@@ -347,6 +352,50 @@ class Go2VisionController:
         """Check if A button was just pressed."""
         return self._check_button_pressed(self.BUTTON_A)
 
+    def _check_b_pressed(self):
+        """Check if B button was just pressed."""
+        return self._check_button_pressed(self.BUTTON_B)
+
+    def _print_depth_data(self):
+        """Print detailed depth camera data for debugging."""
+        depth_image = self.camera.get_depth()
+
+        print("\n" + "=" * 60)
+        print("DEPTH CAMERA DATA")
+        print("=" * 60)
+        print(f"Shape: {depth_image.shape} (expected: 58x87)")
+        print(f"Min/Max/Mean: [{depth_image.min():.3f}, {depth_image.max():.3f}, {depth_image.mean():.3f}]")
+        print(f"Range: [-0.5 = near (0.3m), +0.5 = far (3.0m)]")
+
+        print(f"\nColumn means (LEFT / CENTER / RIGHT):")
+        print(f"  Col 0 (left):   {depth_image[:, 0].mean():+.3f}")
+        print(f"  Col 43 (center): {depth_image[:, 43].mean():+.3f}")
+        print(f"  Col 86 (right):  {depth_image[:, 86].mean():+.3f}")
+
+        print(f"\nPixel grid [row, col]:")
+        print(f"              LEFT(0)   MID(43)   RIGHT(86)")
+        for row_idx, row_name in [(10, "Top(10)"), (29, "Mid(29)"), (50, "Bot(50)")]:
+            print(f"  {row_name}:  {depth_image[row_idx, 0]:+.3f}     {depth_image[row_idx, 43]:+.3f}     {depth_image[row_idx, 86]:+.3f}")
+
+        # Region averages
+        left_avg = depth_image[:, :10].mean()
+        right_avg = depth_image[:, -10:].mean()
+        center_avg = depth_image[:, 38:48].mean()
+        print(f"\nRegion averages (10 col wide):")
+        print(f"  Left region:   {left_avg:+.3f}")
+        print(f"  Center region: {center_avg:+.3f}")
+        print(f"  Right region:  {right_avg:+.3f}")
+
+        asymmetry = left_avg - right_avg
+        print(f"\nAsymmetry (left - right): {asymmetry:+.3f}")
+        if abs(asymmetry) > 0.15:
+            print(f"  >>> HIGH ASYMMETRY! Try --rotate_camera flag <<<")
+
+        # Save for external analysis
+        np.save("depth_snapshot.npy", depth_image)
+        print(f"\nSaved to: depth_snapshot.npy")
+        print("=" * 60)
+
     def _emergency_motor_shutdown(self):
         """Immediately disable all motors (from parkour)."""
         print("\n" + "!" * 70)
@@ -422,6 +471,8 @@ class Go2VisionController:
         print("BUTTON CONTROLS:")
         print("  Y     - Stand up / Exit policy and stand")
         print("  L1    - Start walking policy (from standing)")
+        print("  A     - DEBUG MODE (full sensor printout)")
+        print("  B     - Quick depth + IMU snapshot")
         print("  L2/R2 - EMERGENCY STOP")
         print("=" * 60)
         print("\n>>> Press Y to STAND UP <<<\n")
@@ -485,6 +536,74 @@ class Go2VisionController:
                 self.phase = self.PHASE_STANDING
                 self._reset_walk_state()  # Reset when EXITING debug
                 print("\n>>> Press L1 for DEBUG or Y to SIT DOWN <<<\n")
+
+        # B button: Quick depth + IMU data printout (from any active phase)
+        if self._check_b_pressed():
+            if self.phase in [self.PHASE_STANDING, self.PHASE_WALKING, self.PHASE_DEBUG]:
+                print("\n[B] Depth + IMU snapshot...")
+                self._print_depth_and_imu()
+
+    def _print_depth_and_imu(self):
+        """Print depth camera and IMU data together for orientation debugging."""
+        import datetime
+
+        depth_image = self.camera.get_depth()
+        imu = self.low_state.imu_state
+        quat = imu.quaternion  # [w, x, y, z]
+
+        # Compute roll, pitch, yaw
+        roll = np.arctan2(
+            2 * (quat[0] * quat[1] + quat[2] * quat[3]),
+            1 - 2 * (quat[1]**2 + quat[2]**2)
+        )
+        pitch = np.arcsin(np.clip(
+            2 * (quat[0] * quat[2] - quat[3] * quat[1]),
+            -1, 1
+        ))
+        yaw = np.arctan2(
+            2 * (quat[0] * quat[3] + quat[1] * quat[2]),
+            1 - 2 * (quat[2]**2 + quat[3]**2)
+        )
+
+        # Depth region averages
+        left_avg = depth_image[:, :10].mean()
+        center_avg = depth_image[:, 38:48].mean()
+        right_avg = depth_image[:, -10:].mean()
+
+        # Sample pixels at key locations
+        # Row 29 (middle), cols: 0 (left edge), 21, 43 (center), 65, 86 (right edge)
+        mid_row = 29
+        sample_cols = [0, 21, 43, 65, 86]
+        sample_pixels = [depth_image[mid_row, c] for c in sample_cols]
+
+        timestamp = datetime.datetime.now().strftime('%H:%M:%S')
+
+        # Print to console (compact)
+        print(f"\n[B] {timestamp} | Yaw:{np.degrees(yaw):+6.1f}° | L:{left_avg:+.2f} C:{center_avg:+.2f} R:{right_avg:+.2f}")
+
+        # Save to text file (append)
+        with open("depth_imu_log.txt", "a") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"SNAPSHOT @ {timestamp}\n")
+            f.write(f"{'='*60}\n")
+            f.write(f"\nIMU:\n")
+            f.write(f"  Roll:  {np.degrees(roll):+6.1f} deg\n")
+            f.write(f"  Pitch: {np.degrees(pitch):+6.1f} deg\n")
+            f.write(f"  Yaw:   {np.degrees(yaw):+6.1f} deg  <-- watch this when turning\n")
+            f.write(f"\nDEPTH REGIONS (avg):\n")
+            f.write(f"  LEFT:   {left_avg:+.3f}  (-0.5=close, +0.5=far)\n")
+            f.write(f"  CENTER: {center_avg:+.3f}\n")
+            f.write(f"  RIGHT:  {right_avg:+.3f}\n")
+            f.write(f"\nDEPTH PIXELS (row {mid_row}, L to R):\n")
+            f.write(f"  col  0 (left):   {sample_pixels[0]:+.3f}\n")
+            f.write(f"  col 21:          {sample_pixels[1]:+.3f}\n")
+            f.write(f"  col 43 (center): {sample_pixels[2]:+.3f}\n")
+            f.write(f"  col 65:          {sample_pixels[3]:+.3f}\n")
+            f.write(f"  col 86 (right):  {sample_pixels[4]:+.3f}\n")
+            f.write(f"\n>>> Turn LEFT = yaw increases, LEFT depth should change\n")
+            f.write(f">>> If RIGHT changes instead, use --rotate_camera\n")
+
+        print(f"    Saved to: depth_imu_log.txt")
 
     def _reset_walk_state(self):
         """Reset walking state variables."""
@@ -640,10 +759,34 @@ class Go2VisionController:
         debug_print(f"  Shape: {depth_image.shape} (expected: 58x87)")
         debug_print(f"  Min/Max/Mean: [{depth_image.min():.3f}, {depth_image.max():.3f}, {depth_image.mean():.3f}]")
         debug_print(f"  Expected: [-0.5 (near/0.3m), +0.5 (far/3.0m)]")
-        # Sample pixel values
-        debug_print(f"  Sample pixels (row 29, cols 0,20,40,60,80):")
-        mid_row = depth_image[29, :]
-        debug_print(f"    [{mid_row[0]:+.2f}, {mid_row[20]:+.2f}, {mid_row[40]:+.2f}, {mid_row[60]:+.2f}, {mid_row[80]:+.2f}]")
+
+        # Detailed column analysis (left, center, right edges)
+        debug_print(f"\n  Column analysis (left=0, center=43, right=86):")
+        debug_print(f"    Left col  mean: {depth_image[:, 0].mean():+.3f}")
+        debug_print(f"    Center col mean: {depth_image[:, 43].mean():+.3f}")
+        debug_print(f"    Right col mean: {depth_image[:, 86].mean():+.3f}")
+
+        # Sample pixels across multiple rows (top, mid, bottom)
+        debug_print(f"\n  Pixel grid [row, col] -> value:")
+        debug_print(f"              LEFT(0)   MID(43)   RIGHT(86)")
+        for row_idx, row_name in [(10, "Top(10)"), (29, "Mid(29)"), (50, "Bot(50)")]:
+            debug_print(f"    {row_name}:  {depth_image[row_idx, 0]:+.3f}     {depth_image[row_idx, 43]:+.3f}     {depth_image[row_idx, 86]:+.3f}")
+
+        # Row averages
+        debug_print(f"\n  Row averages (left 10 cols vs right 10 cols):")
+        left_avg = depth_image[:, :10].mean()
+        right_avg = depth_image[:, -10:].mean()
+        center_avg = depth_image[:, 38:48].mean()
+        debug_print(f"    Left 10 cols:   {left_avg:+.3f}")
+        debug_print(f"    Center 10 cols: {center_avg:+.3f}")
+        debug_print(f"    Right 10 cols:  {right_avg:+.3f}")
+
+        # Check for asymmetry (potential orientation issue)
+        asymmetry = left_avg - right_avg
+        debug_print(f"\n  Asymmetry (left - right): {asymmetry:+.3f}")
+        if abs(asymmetry) > 0.2:
+            debug_print(f"  WARNING: High asymmetry! Try --rotate_camera flag")
+
         # Save depth image
         np.save("debug_depth.npy", depth_image)
         debug_print(f"  [Saved to: debug_depth.npy]")
@@ -1066,10 +1209,9 @@ class Go2VisionController:
         next_target_yaw = np.arctan2(next_target_pos_rel[1] / norm_next, next_target_pos_rel[0] / norm_next)
 
         # Compute delta yaw - NON-ZERO when robot drifts off the line!
-        # CPSL uses opposite sign convention: positive delta_yaw = turn right
-        # So we negate: robot_yaw - target_yaw
-        self.delta_yaw = self.robot_yaw - target_yaw
-        self.delta_next_yaw = self.robot_yaw - next_target_yaw
+        # Positive delta_yaw = goal is to the left, robot should turn left
+        self.delta_yaw = target_yaw - self.robot_yaw
+        self.delta_next_yaw = next_target_yaw - self.robot_yaw
 
         # Wrap angles to [-pi, pi]
         self.delta_yaw = np.arctan2(np.sin(self.delta_yaw), np.cos(self.delta_yaw))
