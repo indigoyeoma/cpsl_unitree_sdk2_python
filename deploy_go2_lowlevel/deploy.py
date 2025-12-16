@@ -596,10 +596,8 @@ class Go2VisionController:
         proprio = obs[:self.config.n_proprio]
 
         # Run policy to get action (but don't apply)
-        action_raw = self.policy.get_action(depth_image, obs)
-
-        # Convert to SDK order (same as walking phase)
-        action_sdk = self._training_to_sdk_order(action_raw)
+        # NO CONVERSION NEEDED - policy outputs in SDK order
+        action = self.policy.get_action(depth_image, obs)
 
         # Print everything (and save to file)
         import datetime
@@ -636,22 +634,23 @@ class Go2VisionController:
         debug_print(f"  [{foot_forces[0]:.1f}, {foot_forces[1]:.1f}, {foot_forces[2]:.1f}, {foot_forces[3]:.1f}]")
 
         debug_print("\n--- Depth Image ---")
-        debug_print(f"  Shape: {depth_image.shape}")
-        debug_print(f"  Min/Max: [{depth_image.min():.3f}, {depth_image.max():.3f}]")
-        debug_print(f"  Mean: {depth_image.mean():.3f}")
+        debug_print(f"  Shape: {depth_image.shape} (expected: 58x87)")
+        debug_print(f"  Min/Max/Mean: [{depth_image.min():.3f}, {depth_image.max():.3f}, {depth_image.mean():.3f}]")
+        debug_print(f"  Expected: [-0.5 (near/0.3m), +0.5 (far/3.0m)]")
+        # Sample pixel values
+        debug_print(f"  Sample pixels (row 29, cols 0,20,40,60,80):")
+        mid_row = depth_image[29, :]
+        debug_print(f"    [{mid_row[0]:+.2f}, {mid_row[20]:+.2f}, {mid_row[40]:+.2f}, {mid_row[60]:+.2f}, {mid_row[80]:+.2f}]")
+        # Save depth image
+        np.save("debug_depth.npy", depth_image)
+        debug_print(f"  [Saved to: debug_depth.npy]")
 
-        debug_print("\n--- Policy Action RAW (training order: FL,FR,RL,RR) ---")
-        debug_print(f"  FL: [{action_raw[0]:.3f}, {action_raw[1]:.3f}, {action_raw[2]:.3f}]")
-        debug_print(f"  FR: [{action_raw[3]:.3f}, {action_raw[4]:.3f}, {action_raw[5]:.3f}]")
-        debug_print(f"  RL: [{action_raw[6]:.3f}, {action_raw[7]:.3f}, {action_raw[8]:.3f}]")
-        debug_print(f"  RR: [{action_raw[9]:.3f}, {action_raw[10]:.3f}, {action_raw[11]:.3f}]")
-        debug_print(f"  Raw range: [{action_raw.min():.3f}, {action_raw.max():.3f}]")
-
-        debug_print("\n--- Policy Action CONVERTED (SDK order: FR,FL,RR,RL) ---")
-        debug_print(f"  FR: [{action_sdk[0]:.3f}, {action_sdk[1]:.3f}, {action_sdk[2]:.3f}]")
-        debug_print(f"  FL: [{action_sdk[3]:.3f}, {action_sdk[4]:.3f}, {action_sdk[5]:.3f}]")
-        debug_print(f"  RR: [{action_sdk[6]:.3f}, {action_sdk[7]:.3f}, {action_sdk[8]:.3f}]")
-        debug_print(f"  RL: [{action_sdk[9]:.3f}, {action_sdk[10]:.3f}, {action_sdk[11]:.3f}]")
+        debug_print("\n--- Policy Action (SDK order: FR,FL,RR,RL - no conversion needed) ---")
+        debug_print(f"  FR: [{action[0]:.3f}, {action[1]:.3f}, {action[2]:.3f}]")
+        debug_print(f"  FL: [{action[3]:.3f}, {action[4]:.3f}, {action[5]:.3f}]")
+        debug_print(f"  RR: [{action[6]:.3f}, {action[7]:.3f}, {action[8]:.3f}]")
+        debug_print(f"  RL: [{action[9]:.3f}, {action[10]:.3f}, {action[11]:.3f}]")
+        debug_print(f"  Range: [{action.min():.3f}, {action.max():.3f}]")
 
         debug_print("\n--- Proprio Observation (first 53 dims) ---")
         debug_print(f"  [0:3]   ang_vel*0.25:     [{proprio[0]:.3f}, {proprio[1]:.3f}, {proprio[2]:.3f}]")
@@ -663,16 +662,16 @@ class Go2VisionController:
         debug_print(f"  [25:37] dof_vel*0.05:     min={proprio[25:37].min():.3f}, max={proprio[25:37].max():.3f}")
         debug_print(f"  [49:53] contacts:         [{proprio[49]:.1f}, {proprio[50]:.1f}, {proprio[51]:.1f}, {proprio[52]:.1f}]")
 
-        debug_print("\n--- Last Action (training order: FL,FR,RL,RR - for observation) ---")
+        debug_print("\n--- Last Action (SDK order: FR,FL,RR,RL - policy output stored) ---")
         la = self.last_action
-        debug_print(f"  FL: [{la[0]:.3f}, {la[1]:.3f}, {la[2]:.3f}]")
-        debug_print(f"  FR: [{la[3]:.3f}, {la[4]:.3f}, {la[5]:.3f}]")
-        debug_print(f"  RL: [{la[6]:.3f}, {la[7]:.3f}, {la[8]:.3f}]")
-        debug_print(f"  RR: [{la[9]:.3f}, {la[10]:.3f}, {la[11]:.3f}]")
+        debug_print(f"  FR: [{la[0]:.3f}, {la[1]:.3f}, {la[2]:.3f}]")
+        debug_print(f"  FL: [{la[3]:.3f}, {la[4]:.3f}, {la[5]:.3f}]")
+        debug_print(f"  RR: [{la[6]:.3f}, {la[7]:.3f}, {la[8]:.3f}]")
+        debug_print(f"  RL: [{la[9]:.3f}, {la[10]:.3f}, {la[11]:.3f}]")
         debug_print(f"  (zeros = entered from standing, non-zero = entered from walking)")
 
-        debug_print("\n--- Target Position (SDK order, using converted action) ---")
-        target = self.config.default_joint_angles + action_sdk * self.config.action_scale
+        debug_print("\n--- Target Position (SDK order, no conversion needed) ---")
+        target = self.config.default_joint_angles + action * self.config.action_scale
         debug_print(f"  FR: [{target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f}]")
         debug_print(f"  FL: [{target[3]:.3f}, {target[4]:.3f}, {target[5]:.3f}]")
         debug_print(f"  RR: [{target[6]:.3f}, {target[7]:.3f}, {target[8]:.3f}]")
@@ -707,20 +706,19 @@ class Go2VisionController:
             obs = self._build_observation()
 
             # Run policy inference
-            action_raw = self.policy.get_action(depth_image, obs)
+            action = self.policy.get_action(depth_image, obs)
 
             # Clip actions (must match training: clip to clip_actions/action_scale before scaling)
             # Training clips raw policy output to ±(1.2/0.25) = ±4.8, then scales by 0.25
             clip_limit = self.config.clip_actions / self.config.action_scale  # 4.8
-            action_raw = np.clip(action_raw, -clip_limit, clip_limit)
+            action = np.clip(action, -clip_limit, clip_limit)
 
-            # CRITICAL: Convert action from training order (FL,FR,RL,RR) to SDK order (FR,FL,RR,RL)
-            # The policy was trained with reindexed observations (URDF→SDK) but actions are
-            # applied to URDF-ordered DOFs in the simulator. So policy outputs in training/URDF order.
-            action_sdk = self._training_to_sdk_order(action_raw)
+            # NO CONVERSION NEEDED!
+            # Training reindexes BOTH observations AND actions to SDK order before applying.
+            # So policy outputs in SDK order (FR, FL, RR, RL), same as our SDK motors.
 
-            # Scale action and add to default pose (both now in SDK order)
-            target_delta = action_sdk * self.config.action_scale
+            # Scale action and add to default pose (both in SDK order)
+            target_delta = action * self.config.action_scale
             target_pos = self.config.default_joint_angles + target_delta
 
             # Apply joint limits
@@ -728,23 +726,22 @@ class Go2VisionController:
 
             self.target_positions = target_pos
 
-            # Update history - store in TRAINING order (raw policy output) for observation
-            # The observation last_action should match what the policy sees during training
-            self.last_action = action_raw
-            self.action_history.append(action_raw)
+            # Update history - store action for observation (already in SDK order)
+            self.last_action = action
+            self.action_history.append(action)
 
             # Log data every 10 policy steps (5 times per second)
             self.walk_startup_counter += 1
             if self.walk_startup_counter % 10 == 0:
-                self._log_walk_data(depth_image, obs, action_raw, action_sdk, target_pos)
+                self._log_walk_data(depth_image, obs, action, target_pos)
 
             # Print summary every second
             if self.walk_startup_counter % 50 == 0:
-                print(f"  Action min/max: {action_raw.min():.2f}/{action_raw.max():.2f} | "
+                print(f"  Action min/max: {action.min():.2f}/{action.max():.2f} | "
                       f"Depth min/max: {depth_image.min():.2f}/{depth_image.max():.2f} | "
                       f"{self.distance_traveled:.2f}m")
 
-    def _log_walk_data(self, depth_image, obs, action_raw, action_sdk, target_pos):
+    def _log_walk_data(self, depth_image, obs, action, target_pos):
         """Log comprehensive walking data to file for analysis."""
         import datetime
 
@@ -820,30 +817,84 @@ class Go2VisionController:
 
             # ===== DEPTH IMAGE =====
             f.write(f"\n--- Depth Image ---\n")
-            f.write(f"  Shape: {depth_image.shape}\n")
+            f.write(f"  Shape: {depth_image.shape} (expected: 58x87)\n")
             f.write(f"  Min/Max/Mean/Std: [{depth_image.min():.4f}, {depth_image.max():.4f}, {depth_image.mean():.4f}, {depth_image.std():.4f}]\n")
+            f.write(f"  Expected range: [-0.5 (near/0.3m), +0.5 (far/3.0m)]\n")
+            f.write(f"  Interpretation: -0.5=CLOSE (floor), +0.5=FAR (nothing ahead)\n")
+
+            # ===== TOP vs BOTTOM ANALYSIS (Key sanity check!) =====
+            # Image is 58 rows: row 0 = top (should be FAR), row 57 = bottom (should be CLOSE/floor)
+            h = depth_image.shape[0]  # 58
+            top_rows = depth_image[:10, :]      # Top 10 rows (sky/far)
+            mid_rows = depth_image[20:38, :]    # Middle rows (ahead)
+            bottom_rows = depth_image[-10:, :]  # Bottom 10 rows (floor)
+
+            f.write(f"\n  === TOP vs BOTTOM ANALYSIS (sanity check) ===\n")
+            f.write(f"  TOP 10 rows (row 0-9, should be FAR/+0.5 if nothing ahead):\n")
+            f.write(f"    Min/Max/Mean: [{top_rows.min():.3f}, {top_rows.max():.3f}, {top_rows.mean():.3f}]\n")
+            f.write(f"  MIDDLE rows (row 20-37, what's directly ahead):\n")
+            f.write(f"    Min/Max/Mean: [{mid_rows.min():.3f}, {mid_rows.max():.3f}, {mid_rows.mean():.3f}]\n")
+            f.write(f"  BOTTOM 10 rows (row 48-57, should be CLOSE/-0.5 = floor):\n")
+            f.write(f"    Min/Max/Mean: [{bottom_rows.min():.3f}, {bottom_rows.max():.3f}, {bottom_rows.mean():.3f}]\n")
+
+            # Check if floor detection makes sense
+            if bottom_rows.mean() < top_rows.mean():
+                f.write(f"  ✓ GOOD: Bottom is closer than top (floor detected)\n")
+            else:
+                f.write(f"  ✗ WARNING: Bottom is NOT closer than top! Camera may be inverted or broken\n")
+
+            # Estimate floor distance from bottom row mean
+            # Normalized value to meters: depth_m = (normalized + 0.5) * (3.0 - 0.3) + 0.3
+            bottom_mean_m = (bottom_rows.mean() + 0.5) * (3.0 - 0.3) + 0.3
+            top_mean_m = (top_rows.mean() + 0.5) * (3.0 - 0.3) + 0.3
+            f.write(f"  Estimated distances:\n")
+            f.write(f"    Bottom (floor): ~{bottom_mean_m:.2f}m (expected: 0.3-0.8m for standing robot)\n")
+            f.write(f"    Top (ahead):    ~{top_mean_m:.2f}m (expected: 2-3m if nothing ahead)\n")
+
             # Histogram bins
             hist, _ = np.histogram(depth_image.flatten(), bins=5, range=(-0.5, 0.5))
-            f.write(f"  Histogram [-0.5→0.5]: {hist.tolist()}\n")
+            f.write(f"\n  Histogram [-0.5→0.5]: {hist.tolist()}\n")
+
             # Center region stats (what robot sees directly ahead)
             center_h, center_w = depth_image.shape[0]//2, depth_image.shape[1]//2
             center_region = depth_image[center_h-5:center_h+5, center_w-10:center_w+10]
-            f.write(f"  Center region mean: {center_region.mean():.4f}\n")
+            f.write(f"  Center region (10x20) mean: {center_region.mean():.4f}\n")
 
-            # ===== ACTION RAW (training order) =====
-            f.write(f"\n--- Action RAW (training order: FL,FR,RL,RR) ---\n")
-            f.write(f"  FL: [{action_raw[0]:.4f}, {action_raw[1]:.4f}, {action_raw[2]:.4f}]\n")
-            f.write(f"  FR: [{action_raw[3]:.4f}, {action_raw[4]:.4f}, {action_raw[5]:.4f}]\n")
-            f.write(f"  RL: [{action_raw[6]:.4f}, {action_raw[7]:.4f}, {action_raw[8]:.4f}]\n")
-            f.write(f"  RR: [{action_raw[9]:.4f}, {action_raw[10]:.4f}, {action_raw[11]:.4f}]\n")
-            f.write(f"  Range: [{action_raw.min():.4f}, {action_raw.max():.4f}]\n")
+            # Sample actual pixel values - downsampled view of the depth image
+            f.write(f"\n  Depth image sample (every 10th row, every 15th col):\n")
+            f.write(f"  (row 0=TOP/far, row 50=BOTTOM/floor)\n")
+            for row_idx in range(0, depth_image.shape[0], 10):
+                row_vals = depth_image[row_idx, ::15]  # Every 15th column
+                row_str = " ".join([f"{v:+.2f}" for v in row_vals])
+                f.write(f"    Row {row_idx:2d}: [{row_str}]\n")
 
-            # ===== ACTION CONVERTED (SDK order) =====
-            f.write(f"\n--- Action CONVERTED (SDK order: FR,FL,RR,RL) ---\n")
-            f.write(f"  FR: [{action_sdk[0]:.4f}, {action_sdk[1]:.4f}, {action_sdk[2]:.4f}]\n")
-            f.write(f"  FL: [{action_sdk[3]:.4f}, {action_sdk[4]:.4f}, {action_sdk[5]:.4f}]\n")
-            f.write(f"  RR: [{action_sdk[6]:.4f}, {action_sdk[7]:.4f}, {action_sdk[8]:.4f}]\n")
-            f.write(f"  RL: [{action_sdk[9]:.4f}, {action_sdk[10]:.4f}, {action_sdk[11]:.4f}]\n")
+            # Row-wise statistics
+            f.write(f"\n  Row-wise means (top→bottom, should increase from - to +... wait no):\n")
+            f.write(f"  (Actually: top=far=+, bottom=close=-, so should DECREASE top→bottom)\n")
+            row_means = [depth_image[i, :].mean() for i in range(0, depth_image.shape[0], 10)]
+            f.write(f"    {[f'{m:+.3f}' for m in row_means]}\n")
+
+            # Check for potential issues
+            num_at_min = np.sum(depth_image <= -0.49)
+            num_at_max = np.sum(depth_image >= 0.49)
+            num_zero = np.sum(np.abs(depth_image) < 0.01)
+            f.write(f"\n  Potential issues:\n")
+            f.write(f"    Pixels at min (-0.5/close): {num_at_min} ({100*num_at_min/depth_image.size:.1f}%)\n")
+            f.write(f"    Pixels at max (+0.5/far):   {num_at_max} ({100*num_at_max/depth_image.size:.1f}%)\n")
+            f.write(f"    Pixels near zero (1.65m):   {num_zero} ({100*num_zero/depth_image.size:.1f}%)\n")
+
+            # Save full depth image to file on first log
+            if self.walk_startup_counter == 10:
+                np.save("depth_image_sample.npy", depth_image)
+                f.write(f"  [Saved full depth to: depth_image_sample.npy]\n")
+
+            # ===== ACTION (SDK order - no conversion needed) =====
+            f.write(f"\n--- Action (SDK order: FR,FL,RR,RL) ---\n")
+            f.write(f"  FR: [{action[0]:.4f}, {action[1]:.4f}, {action[2]:.4f}]\n")
+            f.write(f"  FL: [{action[3]:.4f}, {action[4]:.4f}, {action[5]:.4f}]\n")
+            f.write(f"  RR: [{action[6]:.4f}, {action[7]:.4f}, {action[8]:.4f}]\n")
+            f.write(f"  RL: [{action[9]:.4f}, {action[10]:.4f}, {action[11]:.4f}]\n")
+            f.write(f"  Range: [{action.min():.4f}, {action.max():.4f}]\n")
 
             # ===== TARGET POSITIONS =====
             f.write(f"\n--- Target Position (SDK order) ---\n")
