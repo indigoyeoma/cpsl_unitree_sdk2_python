@@ -410,8 +410,8 @@ class Go2VisionController:
         # Update button state for edge detection
         self._update_button_state()
 
-        # Send motor commands (except in IDLE, EMERGENCY, and DEBUG)
-        if self.phase not in [self.PHASE_IDLE, self.PHASE_EMERGENCY, self.PHASE_DEBUG]:
+        # Send motor commands (except in IDLE and EMERGENCY)
+        if self.phase not in [self.PHASE_IDLE, self.PHASE_EMERGENCY]:
             self._send_command()
 
         self.control_step += 1
