@@ -25,19 +25,19 @@ class D435iCamera:
 
     def __init__(
         self,
-        width: int = 640,       # Parkour default: 640
-        height: int = 480,      # Parkour default: 480
+        width: int = 424,       # Lower res for speed (was 640 in parkour)
+        height: int = 240,      # Lower res for speed (was 480 in parkour)
         fps: int = 30,
         target_width: int = 87,
         target_height: int = 58,
         near_clip: float = 0.3,
         far_clip: float = 3.0,
-        rotate_180: bool = False,  # Set True if camera is mounted inverted (like parkour)
-        # Parkour cropping settings (applied before resize)
-        crop_left: int = 28,    # Parkour default: 28
-        crop_right: int = 36,   # Parkour default: 36
-        crop_top: int = 48,     # Parkour default: 48
-        crop_bottom: int = 0,   # Parkour default: 0
+        rotate_180: bool = False,  # Set True if camera is mounted inverted
+        # Cropping settings (matching CPSL training: [:-2, 4:-4] scaled for 424x240)
+        crop_left: int = 4,     # Match training crop ratio
+        crop_right: int = 4,    # Match training crop ratio
+        crop_top: int = 0,      # No top crop in training
+        crop_bottom: int = 2,   # Match training [:-2] crop
     ):
         """
         Initialize D435i camera.
@@ -161,12 +161,13 @@ class D435iCamera:
         Process raw depth frame to policy input format.
 
         IMPORTANT: This MUST match training preprocessing exactly!
-        Processing order (matching parkour go2_visual.py):
+        Processing order (matching CPSL training):
         1. Rotate 180° (if camera inverted)
-        2. Crop edges (parkour: top=48, bottom=0, left=28, right=36)
+        2. Crop edges (training uses [:-2, 4:-4])
         3. Clip depth range
         4. Resize to target (87x58)
         5. Normalize to [-0.5, 0.5]
+        6. Fix edge artifacts
 
         Args:
             depth_frame: RealSense depth frame
@@ -177,25 +178,27 @@ class D435iCamera:
         # Convert to numpy array (in millimeters for z16)
         depth_image = np.asanyarray(depth_frame.get_data()).astype(np.float32)
 
-        # STEP 1: Rotate 180 degrees if camera is mounted inverted (from parkour)
+        # STEP 1: Rotate 180 degrees if camera is mounted inverted
         if self.rotate_180:
             depth_image = np.rot90(depth_image, k=2)  # k=2 for 180 degree rotation
 
         # Convert to meters (negative as in Isaac Gym depth)
         depth_image = -depth_image * self.depth_scale
 
-        # STEP 2: CROP edges (matching parkour go2_visual.py)
-        # Parkour: crop_top=48, crop_bottom=0, crop_left=28, crop_right=36
-        # From 640x480 → (640-28-36) x (480-48-0) = 576 x 432
-        top = self.crop_top
-        bottom = self.crop_bottom if self.crop_bottom > 0 else None
-        left = self.crop_left
+        # STEP 2: CROP edges (matching CPSL training)
+        # Training uses [:-2, 4:-4] on 106x60 → we use similar ratio on 424x240
+        top = self.crop_top if self.crop_top > 0 else None
+        bottom = -self.crop_bottom if self.crop_bottom > 0 else None
+        left = self.crop_left if self.crop_left > 0 else None
         right = -self.crop_right if self.crop_right > 0 else None
 
-        if bottom is None:
-            depth_image = depth_image[top:, left:right]
-        else:
-            depth_image = depth_image[top:-bottom, left:right]
+        # Build slice - handle None cases
+        row_start = top if top else 0
+        row_end = bottom  # None means to end
+        col_start = left if left else 0
+        col_end = right  # None means to end
+
+        depth_image = depth_image[row_start:row_end, col_start:col_end]
 
         # STEP 3: Clip to valid range (negative values!)
         depth_image = np.clip(depth_image, -self.far_clip, -self.near_clip)
@@ -216,10 +219,13 @@ class D435iCamera:
         # (depth - near_clip) / (far_clip - near_clip) - 0.5
         depth_image = (depth_image - self.near_clip) / (self.far_clip - self.near_clip) - 0.5
 
+        # STEP 6: Fix left-edge artifacts (stuck pixels at -0.5 cause right-turning)
+        # Copy column 1 to column 0 to fix camera edge artifacts
+        depth_image[:, 0] = depth_image[:, 1]
+
         # Result: range [-0.5, 0.5]
-        #   near (0.3m) → (0.3-0.3)/(3.0-0.3) - 0.5 = -0.5  (CLOSE = LOW)
-        #   mid (1.65m) → (1.65-0.3)/(3.0-0.3) - 0.5 = 0.0
-        #   far (3.0m) → (3.0-0.3)/(3.0-0.3) - 0.5 = +0.5  (FAR = HIGH)
+        #   near (0.3m) → -0.5  (CLOSE = LOW)
+        #   far (3.0m) → +0.5   (FAR = HIGH)
 
         return depth_image
 
