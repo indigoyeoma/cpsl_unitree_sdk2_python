@@ -570,20 +570,20 @@ class Go2VisionController:
         if not hasattr(self, 'target_positions'):
             return
 
-        # Use higher gains for sit↔stand transitions (need torque to lift/lower)
-        # Use training gains for hold and walk (no sudden sag between them)
-        if self.phase == 0 or self.phase == 3:  # sit→stand or stand→sit
-            kp = self.config.kp_stand  # 70.0 (strong for transitions)
-            kd = self.config.kd_stand  # 3.0
-        else:  # hold (phase 1) and walk (phase 2)
-            kp = self.config.kp_walk   # 25.0 (training gains)
+        # Use training gains ONLY during walking (must match sim2real)
+        # Use strong gains for all transitions and holding position
+        if self.phase == self.PHASE_WALKING:
+            kp = self.config.kp_walk   # 25.0 (training gains for policy)
             kd = self.config.kd_walk   # 0.6
+        else:  # SIT_TO_STAND, STANDING, STAND_TO_SIT all need strong gains
+            kp = self.config.kp_stand  # 70.0 (strong for transitions/holding)
+            kd = self.config.kd_stand  # 3.0
 
         # Get current state for torque clipping
         target_pos = self.target_positions.copy()
 
-        # Apply torque clipping during walking phase (phase 2) to prevent motor damage
-        if self.torque_clip_enabled and self.phase == 2:
+        # Apply torque clipping during walking phase to prevent motor damage
+        if self.torque_clip_enabled and self.phase == self.PHASE_WALKING:
             current_pos = self._get_joint_positions()
             current_vel = self._get_joint_velocities()
             target_pos = JointLimits.clip_by_torque_limit(
@@ -819,18 +819,6 @@ def main():
     print(f"Command velocity: {args.command_vx} m/s")
     print(f"Device:         {args.device}")
     print("=" * 70)
-
-    if not args.use_dummy_camera:
-        print("\n⚠️  SAFETY WARNING")
-        print("  - Clear 3-5 meters in front of robot")
-        print("  - Press Ctrl+C anytime for safe shutdown")
-        if args.skip_standup:
-            print("  - Robot will: Stand→Hold→Walk→Sit (skipping sit-to-stand)")
-        else:
-            print("  - Robot will: Sit→Stand→Walk→Sit")
-        response = input("\nReady? (yes/no): ")
-        if response.lower() not in ['yes', 'y']:
-            return 0
 
     # Initialize DDS
     print("\nInitializing DDS...")
