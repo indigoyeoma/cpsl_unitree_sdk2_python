@@ -656,8 +656,8 @@ class Go2VisionController:
         debug_print(f"  [0:3]   ang_vel*0.25:     [{proprio[0]:.3f}, {proprio[1]:.3f}, {proprio[2]:.3f}]")
         debug_print(f"  [3:5]   roll,pitch:       [{proprio[3]:.3f}, {proprio[4]:.3f}]")
         debug_print(f"  [5:8]   yaw (mask,d,dn):  [{proprio[5]:.3f}, {proprio[6]:.3f}, {proprio[7]:.3f}]")
-        debug_print(f"  [8:10]  cmd (vx,vy):      [{proprio[8]:.3f}, {proprio[9]:.3f}] (vx={self.config.command_vx})")
-        debug_print(f"  [10]    cmd (vyaw):       {proprio[10]:.3f}")
+        debug_print(f"  [8:10]  cmd (masked):     [{proprio[8]:.3f}, {proprio[9]:.3f}] (should be 0,0)")
+        debug_print(f"  [10]    cmd (vx):         {proprio[10]:.3f} (should be {self.config.command_vx})")
         debug_print(f"  [11:13] env_class:        [{proprio[11]:.3f}, {proprio[12]:.3f}]")
         debug_print(f"  [13:25] dof_pos:          min={proprio[13:25].min():.3f}, max={proprio[13:25].max():.3f}")
         debug_print(f"  [25:37] dof_vel*0.05:     min={proprio[25:37].min():.3f}, max={proprio[25:37].max():.3f}")
@@ -919,8 +919,8 @@ class Go2VisionController:
             f.write(f"  [5]     delta_yaw_mask:  {proprio[5]:.4f}\n")
             f.write(f"  [6]     delta_yaw:       {proprio[6]:.4f}\n")
             f.write(f"  [7]     delta_next_yaw:  {proprio[7]:.4f}\n")
-            f.write(f"  [8:10]  cmd (vx,vy):     [{proprio[8]:.4f}, {proprio[9]:.4f}] (vx should be {self.config.command_vx})\n")
-            f.write(f"  [10]    cmd (vyaw):      {proprio[10]:.4f}\n")
+            f.write(f"  [8:10]  cmd (masked):    [{proprio[8]:.4f}, {proprio[9]:.4f}] (should be 0,0)\n")
+            f.write(f"  [10]    cmd (vx):        {proprio[10]:.4f} (should be {self.config.command_vx})\n")
             f.write(f"  [11:13] env_class:       [{proprio[11]:.4f}, {proprio[12]:.4f}]\n")
             f.write(f"  [13:25] dof_pos (12):    [{', '.join([f'{x:.3f}' for x in proprio[13:25]])}]\n")
             f.write(f"  [25:37] dof_vel*0.05:    [{', '.join([f'{x:.3f}' for x in proprio[25:37]])}]\n")
@@ -1107,17 +1107,17 @@ class Go2VisionController:
         dof_vel_scale = 0.05
 
         # Build proprio (53 dims)
-        # Training observation order from legged_robot.py lines 392-407:
-        # ang_vel(3), euler[:2](2), delta_yaw(1), delta_yaw(1), delta_next_yaw(1),
-        # commands[:2](2), commands[2:3](1), env_class(2), dof_pos(12), dof_vel(12), last_action(12), contacts(4)
+        # Training observation order from legged_robot.py lines 393-407:
+        # ang_vel(3), imu_obs(2), 0*delta_yaw(1), delta_yaw(1), delta_next_yaw(1),
+        # 0*commands[:2](2), commands[0:1](1), env_class(2), dof_pos(12), dof_vel(12), last_action(12), contacts(4)
         proprio = np.concatenate([
             ang_vel * ang_vel_scale,       # 3  [0:3]
             [roll, pitch],                  # 2  [3:5]
-            [0.0],                          # delta_yaw (masked in training) [5]
-            [self.delta_yaw],               # delta_yaw (yaw error to goal) [6]
+            [0.0],                          # 0*delta_yaw (masked) [5]
+            [self.delta_yaw],               # delta_yaw [6]
             [self.delta_next_yaw],          # delta_next_yaw [7]
-            [self.config.command_vx, 0.0],  # commands[:2] = [vx, vy] [8:10] - FIXED ORDER!
-            [0.0],                          # commands[2:3] = vyaw [10]
+            [0.0, 0.0],                     # 0*commands[:2] (MASKED vx,vy) [8:10]
+            [self.config.command_vx],       # commands[0:1] = vx [10] - THIS IS THE ACTUAL COMMAND!
             [1.0, 0.0],                     # env_class flags [11:13]
             dof_pos * dof_pos_scale,        # 12 [13:25]
             joint_vel * dof_vel_scale,      # 12 [25:37] (SDK order = observation order)
