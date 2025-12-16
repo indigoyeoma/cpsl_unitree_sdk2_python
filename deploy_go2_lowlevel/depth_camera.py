@@ -194,6 +194,10 @@ class D435iCamera:
         # (depth - near_clip) / (far_clip - near_clip) - 0.5
         depth_image = (depth_image - self.near_clip) / (self.far_clip - self.near_clip) - 0.5
 
+        # STEP 5: Fix stuck left edge pixels (camera artifact)
+        # Copy column 1 to column 0 to remove the -0.5 stuck pixels
+        depth_image[:, 0] = depth_image[:, 1]
+
         # Result: range [-0.5, 0.5]
         #   near (0.3m) → (0.3-0.3)/(3.0-0.3) - 0.5 = -0.5  (CLOSE = LOW)
         #   mid (1.65m) → (1.65-0.3)/(3.0-0.3) - 0.5 = 0.0
