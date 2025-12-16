@@ -691,6 +691,9 @@ class Go2VisionController:
         # Set start position on first walk iteration
         if self.start_position is None:
             self.start_position = self.robot_position.copy()
+            # Clear walk log file at start
+            open("walk_log.txt", "w").close()
+            print("  Logging to: walk_log.txt")
 
         # Update distance traveled
         self.distance_traveled = np.linalg.norm(self.robot_position - self.start_position)
@@ -704,17 +707,17 @@ class Go2VisionController:
             obs = self._build_observation()
 
             # Run policy inference
-            action = self.policy.get_action(depth_image, obs)
+            action_raw = self.policy.get_action(depth_image, obs)
 
             # Clip actions (must match training: clip to clip_actions/action_scale before scaling)
             # Training clips raw policy output to ±(1.2/0.25) = ±4.8, then scales by 0.25
             clip_limit = self.config.clip_actions / self.config.action_scale  # 4.8
-            action = np.clip(action, -clip_limit, clip_limit)
+            action_raw = np.clip(action_raw, -clip_limit, clip_limit)
 
             # CRITICAL: Convert action from training order (FL,FR,RL,RR) to SDK order (FR,FL,RR,RL)
             # The policy was trained with reindexed observations (URDF→SDK) but actions are
             # applied to URDF-ordered DOFs in the simulator. So policy outputs in training/URDF order.
-            action_sdk = self._training_to_sdk_order(action)
+            action_sdk = self._training_to_sdk_order(action_raw)
 
             # Scale action and add to default pose (both now in SDK order)
             target_delta = action_sdk * self.config.action_scale
@@ -729,12 +732,171 @@ class Go2VisionController:
             self.last_action = action_sdk
             self.action_history.append(action_sdk)
 
-            # Debug: print action and depth stats every second
+            # Log data every 10 policy steps (5 times per second)
             self.walk_startup_counter += 1
+            if self.walk_startup_counter % 10 == 0:
+                self._log_walk_data(depth_image, obs, action_raw, action_sdk, target_pos)
+
+            # Print summary every second
             if self.walk_startup_counter % 50 == 0:
-                print(f"  Action min/max: {action.min():.2f}/{action.max():.2f} | "
+                print(f"  Action min/max: {action_raw.min():.2f}/{action_raw.max():.2f} | "
                       f"Depth min/max: {depth_image.min():.2f}/{depth_image.max():.2f} | "
                       f"{self.distance_traveled:.2f}m")
+
+    def _log_walk_data(self, depth_image, obs, action_raw, action_sdk, target_pos):
+        """Log comprehensive walking data to file for analysis."""
+        import datetime
+
+        with open("walk_log.txt", "a") as f:
+            f.write(f"\n{'='*70}\n")
+            f.write(f"WALK LOG - {datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]} - Step {self.walk_startup_counter}\n")
+            f.write(f"{'='*70}\n")
+
+            # ===== IMU DATA =====
+            imu = self.low_state.imu_state
+            quat = imu.quaternion
+            roll = np.arctan2(
+                2 * (quat[0] * quat[1] + quat[2] * quat[3]),
+                1 - 2 * (quat[1]**2 + quat[2]**2)
+            )
+            pitch = np.arcsin(np.clip(
+                2 * (quat[0] * quat[2] - quat[3] * quat[1]), -1, 1
+            ))
+            yaw = np.arctan2(
+                2 * (quat[0] * quat[3] + quat[1] * quat[2]),
+                1 - 2 * (quat[2]**2 + quat[3]**2)
+            )
+            ang_vel = np.array([imu.gyroscope[0], imu.gyroscope[1], imu.gyroscope[2]])
+            accel = np.array([imu.accelerometer[0], imu.accelerometer[1], imu.accelerometer[2]])
+
+            f.write(f"\n--- IMU ---\n")
+            f.write(f"  Quaternion [w,x,y,z]: [{quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f}]\n")
+            f.write(f"  Roll/Pitch/Yaw (deg): [{np.degrees(roll):.2f}, {np.degrees(pitch):.2f}, {np.degrees(yaw):.2f}]\n")
+            f.write(f"  Roll/Pitch/Yaw (rad): [{roll:.4f}, {pitch:.4f}, {yaw:.4f}]\n")
+            f.write(f"  Angular Vel (rad/s): [{ang_vel[0]:.4f}, {ang_vel[1]:.4f}, {ang_vel[2]:.4f}]\n")
+            f.write(f"  Accelerometer (m/s2): [{accel[0]:.4f}, {accel[1]:.4f}, {accel[2]:.4f}]\n")
+
+            # ===== JOINT POSITIONS (SDK order) =====
+            joint_pos = self._get_joint_positions()
+            joint_vel = self._get_joint_velocities()
+            default_pos = self.config.default_joint_angles
+
+            f.write(f"\n--- Joint Positions (SDK: FR,FL,RR,RL) ---\n")
+            f.write(f"  FR: [{joint_pos[0]:.4f}, {joint_pos[1]:.4f}, {joint_pos[2]:.4f}]\n")
+            f.write(f"  FL: [{joint_pos[3]:.4f}, {joint_pos[4]:.4f}, {joint_pos[5]:.4f}]\n")
+            f.write(f"  RR: [{joint_pos[6]:.4f}, {joint_pos[7]:.4f}, {joint_pos[8]:.4f}]\n")
+            f.write(f"  RL: [{joint_pos[9]:.4f}, {joint_pos[10]:.4f}, {joint_pos[11]:.4f}]\n")
+
+            f.write(f"\n--- Joint Velocities (SDK: FR,FL,RR,RL) ---\n")
+            f.write(f"  FR: [{joint_vel[0]:.4f}, {joint_vel[1]:.4f}, {joint_vel[2]:.4f}]\n")
+            f.write(f"  FL: [{joint_vel[3]:.4f}, {joint_vel[4]:.4f}, {joint_vel[5]:.4f}]\n")
+            f.write(f"  RR: [{joint_vel[6]:.4f}, {joint_vel[7]:.4f}, {joint_vel[8]:.4f}]\n")
+            f.write(f"  RL: [{joint_vel[9]:.4f}, {joint_vel[10]:.4f}, {joint_vel[11]:.4f}]\n")
+
+            # Position error from default
+            pos_err = joint_pos - default_pos
+            f.write(f"\n--- Position Error (pos - default) ---\n")
+            f.write(f"  FR: [{pos_err[0]:.4f}, {pos_err[1]:.4f}, {pos_err[2]:.4f}]\n")
+            f.write(f"  FL: [{pos_err[3]:.4f}, {pos_err[4]:.4f}, {pos_err[5]:.4f}]\n")
+            f.write(f"  RR: [{pos_err[6]:.4f}, {pos_err[7]:.4f}, {pos_err[8]:.4f}]\n")
+            f.write(f"  RL: [{pos_err[9]:.4f}, {pos_err[10]:.4f}, {pos_err[11]:.4f}]\n")
+
+            # Tracking error (target - actual)
+            track_err = target_pos - joint_pos
+            f.write(f"\n--- Tracking Error (target - actual) ---\n")
+            f.write(f"  FR: [{track_err[0]:.4f}, {track_err[1]:.4f}, {track_err[2]:.4f}]\n")
+            f.write(f"  FL: [{track_err[3]:.4f}, {track_err[4]:.4f}, {track_err[5]:.4f}]\n")
+            f.write(f"  RR: [{track_err[6]:.4f}, {track_err[7]:.4f}, {track_err[8]:.4f}]\n")
+            f.write(f"  RL: [{track_err[9]:.4f}, {track_err[10]:.4f}, {track_err[11]:.4f}]\n")
+            f.write(f"  Max tracking error: {np.abs(track_err).max():.4f}\n")
+
+            # ===== FOOT FORCES =====
+            foot_forces = [self.low_state.foot_force[i] for i in range(4)]
+            f.write(f"\n--- Foot Forces (FR,FL,RR,RL) ---\n")
+            f.write(f"  Raw: [{foot_forces[0]:.1f}, {foot_forces[1]:.1f}, {foot_forces[2]:.1f}, {foot_forces[3]:.1f}]\n")
+            contacts = [1 if f > 20 else 0 for f in foot_forces]
+            f.write(f"  Contact (>20): [{contacts[0]}, {contacts[1]}, {contacts[2]}, {contacts[3]}]\n")
+
+            # ===== DEPTH IMAGE =====
+            f.write(f"\n--- Depth Image ---\n")
+            f.write(f"  Shape: {depth_image.shape}\n")
+            f.write(f"  Min/Max/Mean/Std: [{depth_image.min():.4f}, {depth_image.max():.4f}, {depth_image.mean():.4f}, {depth_image.std():.4f}]\n")
+            # Histogram bins
+            hist, _ = np.histogram(depth_image.flatten(), bins=5, range=(-0.5, 0.5))
+            f.write(f"  Histogram [-0.5→0.5]: {hist.tolist()}\n")
+            # Center region stats (what robot sees directly ahead)
+            center_h, center_w = depth_image.shape[0]//2, depth_image.shape[1]//2
+            center_region = depth_image[center_h-5:center_h+5, center_w-10:center_w+10]
+            f.write(f"  Center region mean: {center_region.mean():.4f}\n")
+
+            # ===== ACTION RAW (training order) =====
+            f.write(f"\n--- Action RAW (training order: FL,FR,RL,RR) ---\n")
+            f.write(f"  FL: [{action_raw[0]:.4f}, {action_raw[1]:.4f}, {action_raw[2]:.4f}]\n")
+            f.write(f"  FR: [{action_raw[3]:.4f}, {action_raw[4]:.4f}, {action_raw[5]:.4f}]\n")
+            f.write(f"  RL: [{action_raw[6]:.4f}, {action_raw[7]:.4f}, {action_raw[8]:.4f}]\n")
+            f.write(f"  RR: [{action_raw[9]:.4f}, {action_raw[10]:.4f}, {action_raw[11]:.4f}]\n")
+            f.write(f"  Range: [{action_raw.min():.4f}, {action_raw.max():.4f}]\n")
+
+            # ===== ACTION CONVERTED (SDK order) =====
+            f.write(f"\n--- Action CONVERTED (SDK order: FR,FL,RR,RL) ---\n")
+            f.write(f"  FR: [{action_sdk[0]:.4f}, {action_sdk[1]:.4f}, {action_sdk[2]:.4f}]\n")
+            f.write(f"  FL: [{action_sdk[3]:.4f}, {action_sdk[4]:.4f}, {action_sdk[5]:.4f}]\n")
+            f.write(f"  RR: [{action_sdk[6]:.4f}, {action_sdk[7]:.4f}, {action_sdk[8]:.4f}]\n")
+            f.write(f"  RL: [{action_sdk[9]:.4f}, {action_sdk[10]:.4f}, {action_sdk[11]:.4f}]\n")
+
+            # ===== TARGET POSITIONS =====
+            f.write(f"\n--- Target Position (SDK order) ---\n")
+            f.write(f"  FR: [{target_pos[0]:.4f}, {target_pos[1]:.4f}, {target_pos[2]:.4f}]\n")
+            f.write(f"  FL: [{target_pos[3]:.4f}, {target_pos[4]:.4f}, {target_pos[5]:.4f}]\n")
+            f.write(f"  RR: [{target_pos[6]:.4f}, {target_pos[7]:.4f}, {target_pos[8]:.4f}]\n")
+            f.write(f"  RL: [{target_pos[9]:.4f}, {target_pos[10]:.4f}, {target_pos[11]:.4f}]\n")
+
+            # ===== DEFAULT POSITIONS (for reference) =====
+            f.write(f"\n--- Default Position (SDK order) ---\n")
+            f.write(f"  FR: [{default_pos[0]:.4f}, {default_pos[1]:.4f}, {default_pos[2]:.4f}]\n")
+            f.write(f"  FL: [{default_pos[3]:.4f}, {default_pos[4]:.4f}, {default_pos[5]:.4f}]\n")
+            f.write(f"  RR: [{default_pos[6]:.4f}, {default_pos[7]:.4f}, {default_pos[8]:.4f}]\n")
+            f.write(f"  RL: [{default_pos[9]:.4f}, {default_pos[10]:.4f}, {default_pos[11]:.4f}]\n")
+
+            # ===== FULL PROPRIO OBSERVATION (53 dims) =====
+            proprio = obs[:self.config.n_proprio]
+            f.write(f"\n--- Full Proprio Observation (53 dims) ---\n")
+            f.write(f"  [0:3]   ang_vel*0.25:    [{proprio[0]:.4f}, {proprio[1]:.4f}, {proprio[2]:.4f}]\n")
+            f.write(f"  [3:5]   roll,pitch:      [{proprio[3]:.4f}, {proprio[4]:.4f}]\n")
+            f.write(f"  [5]     delta_yaw_mask:  {proprio[5]:.4f}\n")
+            f.write(f"  [6]     delta_yaw:       {proprio[6]:.4f}\n")
+            f.write(f"  [7]     delta_next_yaw:  {proprio[7]:.4f}\n")
+            f.write(f"  [8:11]  cmd (vx,vy,vz):  [{proprio[8]:.4f}, {proprio[9]:.4f}, {proprio[10]:.4f}]\n")
+            f.write(f"  [11:13] env_class:       [{proprio[11]:.4f}, {proprio[12]:.4f}]\n")
+            f.write(f"  [13:25] dof_pos (12):    [{', '.join([f'{x:.3f}' for x in proprio[13:25]])}]\n")
+            f.write(f"  [25:37] dof_vel*0.05:    [{', '.join([f'{x:.3f}' for x in proprio[25:37]])}]\n")
+            f.write(f"  [37:49] last_action:     [{', '.join([f'{x:.3f}' for x in proprio[37:49]])}]\n")
+            f.write(f"  [49:53] contacts:        [{proprio[49]:.2f}, {proprio[50]:.2f}, {proprio[51]:.2f}, {proprio[52]:.2f}]\n")
+
+            # ===== LAST ACTION (from history) =====
+            la = self.last_action
+            f.write(f"\n--- Last Action (SDK order, stored) ---\n")
+            f.write(f"  FR: [{la[0]:.4f}, {la[1]:.4f}, {la[2]:.4f}]\n")
+            f.write(f"  FL: [{la[3]:.4f}, {la[4]:.4f}, {la[5]:.4f}]\n")
+            f.write(f"  RR: [{la[6]:.4f}, {la[7]:.4f}, {la[8]:.4f}]\n")
+            f.write(f"  RL: [{la[9]:.4f}, {la[10]:.4f}, {la[11]:.4f}]\n")
+
+            # ===== NAVIGATION/GOAL DATA =====
+            f.write(f"\n--- Navigation ---\n")
+            f.write(f"  Robot position: [{self.robot_position[0]:.4f}, {self.robot_position[1]:.4f}]\n")
+            f.write(f"  Robot yaw (rad): {self.robot_yaw:.4f}\n")
+            f.write(f"  Current goal: [{self.current_goal[0]:.4f}, {self.current_goal[1]:.4f}]\n")
+            f.write(f"  Delta yaw: {self.delta_yaw:.4f}\n")
+            f.write(f"  Delta next yaw: {self.delta_next_yaw:.4f}\n")
+            f.write(f"  Distance traveled: {self.distance_traveled:.4f}\n")
+
+            # ===== CONFIG VALUES (for reference) =====
+            f.write(f"\n--- Config ---\n")
+            f.write(f"  action_scale: {self.config.action_scale}\n")
+            f.write(f"  clip_actions: {self.config.clip_actions}\n")
+            f.write(f"  kp_walk: {self.config.kp_walk}\n")
+            f.write(f"  kd_walk: {self.config.kd_walk}\n")
+            f.write(f"  command_vx: {self.config.command_vx}\n")
 
     def _phase_stand_to_sit(self):
         """Phase STAND_TO_SIT: Safe sit down from standing."""
