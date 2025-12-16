@@ -25,28 +25,27 @@ class D435iCamera:
 
     def __init__(
         self,
-        width: int = 424,       # Lower res for speed (was 640 in parkour)
-        height: int = 240,      # Lower res for speed (was 480 in parkour)
+        width: int = 640,       # Match parkour resolution exactly
+        height: int = 480,      # Match parkour resolution exactly
         fps: int = 30,
         target_width: int = 87,
         target_height: int = 58,
         near_clip: float = 0.3,
         far_clip: float = 3.0,
         rotate_180: bool = False,  # Set True if camera is mounted inverted
-        # Cropping settings (matching parkour go2_visual.py ratios)
+        # Cropping settings (matching parkour go2_visual.py EXACTLY)
         # Parkour uses 640x480 with crop_top=48, crop_left=28, crop_right=36, crop_bottom=0
-        # Proportions: top=10%, left=4.4%, right=5.6%, bottom=0%
-        crop_left: int = 19,    # 424 * 0.044 ≈ 19 (matches parkour 4.4% left crop)
-        crop_right: int = 24,   # 424 * 0.056 ≈ 24 (matches parkour 5.6% right crop)
-        crop_top: int = 24,     # 240 * 0.10 = 24 (matches parkour 10% top crop)
-        crop_bottom: int = 0,   # No bottom crop (matches parkour)
+        crop_left: int = 28,    # Exact parkour value
+        crop_right: int = 36,   # Exact parkour value
+        crop_top: int = 48,     # Exact parkour value
+        crop_bottom: int = 0,   # Exact parkour value
     ):
         """
         Initialize D435i camera.
 
         Args:
-            width: Capture width (native resolution) - parkour uses 640
-            height: Capture height (native resolution) - parkour uses 480
+            width: Capture width (640 to match parkour exactly)
+            height: Capture height (480 to match parkour exactly)
             fps: Capture framerate
             target_width: Output width for policy (after resize)
             target_height: Output height for policy (after resize)

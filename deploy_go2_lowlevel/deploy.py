@@ -1012,6 +1012,23 @@ class Go2VisionController:
                 row_str = " ".join([f"{v:+.2f}" for v in row_vals])
                 f.write(f"    Row {row_idx:2d}: [{row_str}]\n")
 
+            # LEFT EDGE ARTIFACT CHECK - columns 0-9 for bottom rows
+            f.write(f"\n  === LEFT EDGE CHECK (cols 0-9, should all be similar if no artifact) ===\n")
+            for row_idx in [30, 40, 50]:  # Check floor rows
+                if row_idx < depth_image.shape[0]:
+                    left_cols = depth_image[row_idx, :10]  # First 10 columns
+                    col_str = " ".join([f"{v:+.2f}" for v in left_cols])
+                    f.write(f"    Row {row_idx:2d} cols 0-9: [{col_str}]\n")
+            # Compare col 0 vs col 5 mean across all rows
+            col0_mean = depth_image[:, 0].mean()
+            col5_mean = depth_image[:, 5].mean()
+            col10_mean = depth_image[:, 10].mean() if depth_image.shape[1] > 10 else 0
+            f.write(f"    Column means: col0={col0_mean:+.3f}, col5={col5_mean:+.3f}, col10={col10_mean:+.3f}\n")
+            if col0_mean > col5_mean + 0.1:
+                f.write(f"    ⚠️ LEFT EDGE ARTIFACT DETECTED (col0 is {col0_mean - col5_mean:.2f} higher than col5)\n")
+            else:
+                f.write(f"    ✓ Left edge looks OK\n")
+
             # Row-wise statistics
             f.write(f"\n  Row-wise means (top→bottom, should increase from - to +... wait no):\n")
             f.write(f"  (Actually: top=far=+, bottom=close=-, so should DECREASE top→bottom)\n")
