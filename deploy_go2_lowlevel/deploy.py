@@ -143,8 +143,8 @@ class Go2VisionController:
             0.0, 1.4, -2.7,   # RL
         ])
 
-        # Standing pose (from training config, SDK order)
-        self._stand_pos = self._training_to_sdk_order(config.default_joint_angles)
+        # Standing pose (already in SDK order)
+        self._stand_pos = config.default_joint_angles.copy()
 
         # Start position (captured from robot)
         self.start_pos = np.zeros(12)
@@ -518,18 +518,21 @@ class Go2VisionController:
             # Run policy inference
             action = self.policy.get_action(depth_image, obs)
 
-            # Clip actions (must match training: clip_actions = 1.2)
-            action = np.clip(action, -self.config.clip_actions, self.config.clip_actions)
+            # Clip actions (must match training: clip to clip_actions/action_scale before scaling)
+            # Training clips raw policy output to ±(1.2/0.25) = ±4.8, then scales by 0.25
+            clip_limit = self.config.clip_actions / self.config.action_scale  # 4.8
+            action = np.clip(action, -clip_limit, clip_limit)
 
-            # Scale action and add to default pose (in training order)
+            # Scale action and add to default pose
+            # Policy outputs in SDK/observation order (FR,FL,RR,RL), same as SDK!
             target_delta = action * self.config.action_scale
-            target_pos_train = self.config.default_joint_angles + target_delta
+            target_pos = self.config.default_joint_angles + target_delta  # Both in SDK order
 
             # Apply joint limits
-            target_pos_train = JointLimits.clip_joints(target_pos_train)
+            target_pos = JointLimits.clip_joints(target_pos)
 
-            # Convert to SDK order
-            self.target_positions = self._training_to_sdk_order(target_pos_train)
+            # No conversion needed - already in SDK order!
+            self.target_positions = target_pos
 
             # Update history
             self.last_action = action
@@ -570,14 +573,9 @@ class Go2VisionController:
         if not hasattr(self, 'target_positions'):
             return
 
-        # Use training gains ONLY during walking (must match sim2real)
-        # Use strong gains for all transitions and holding position
-        if self.phase == self.PHASE_WALKING:
-            kp = self.config.kp_walk   # 25.0 (training gains for policy)
-            kd = self.config.kd_walk   # 0.6
-        else:  # SIT_TO_STAND, STANDING, STAND_TO_SIT all need strong gains
-            kp = self.config.kp_stand  # 70.0 (strong for transitions/holding)
-            kd = self.config.kd_stand  # 3.0
+        # Use training gains for ALL phases (like parkour does)
+        kp = self.config.kp_walk   # 25.0 (training gains)
+        kd = self.config.kd_walk   # 0.6
 
         # Get current state for torque clipping
         target_pos = self.target_positions.copy()
@@ -672,21 +670,21 @@ class Go2VisionController:
         # Angular velocity
         ang_vel = np.array([imu.gyroscope[0], imu.gyroscope[1], imu.gyroscope[2]])
 
-        # Joint states
-        joint_pos = self._get_joint_positions()
-        joint_vel = self._get_joint_velocities()
-        joint_pos_train = self._sdk_to_training_order(joint_pos)
-        joint_vel_train = self._sdk_to_training_order(joint_vel)
+        # Joint states (SDK order = FR,FL,RR,RL = training observation order after reindex)
+        joint_pos = self._get_joint_positions()  # SDK order
+        joint_vel = self._get_joint_velocities()  # SDK order
 
-        dof_pos = joint_pos_train - self.config.default_joint_angles
+        # Use SDK order directly - it matches training observation order!
+        dof_pos = joint_pos - self.config.default_joint_angles  # Both in SDK order
         last_action = self.last_action if len(self.action_history) > 0 else np.zeros(12)
 
-        # Contacts
+        # Contacts (SDK: FR=0, FL=1, RR=2, RL=3)
+        # Training observation order (after reindex_feet): FR, FL, RR, RL
         contacts = np.array([
-            self.low_state.foot_force[1] > 20,  # FL
             self.low_state.foot_force[0] > 20,  # FR
-            self.low_state.foot_force[3] > 20,  # RL
+            self.low_state.foot_force[1] > 20,  # FL
             self.low_state.foot_force[2] > 20,  # RR
+            self.low_state.foot_force[3] > 20,  # RL
         ]).astype(np.float32) - 0.5
 
         # Scales
@@ -705,7 +703,7 @@ class Go2VisionController:
             [self.config.command_vx],  # command_vx RAW (no scaling - matches training!)
             [1.0, 0.0],                     # env_class flags
             dof_pos * dof_pos_scale,        # 12
-            joint_vel_train * dof_vel_scale, # 12
+            joint_vel * dof_vel_scale,      # 12 (SDK order = observation order)
             last_action,                    # 12
             contacts,                       # 4
         ]).astype(np.float32)

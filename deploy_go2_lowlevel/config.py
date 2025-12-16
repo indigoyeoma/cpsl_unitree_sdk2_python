@@ -29,11 +29,21 @@ class DeployConfig:
     kd = 3.0
 
     # Default standing pose (from training config)
-    default_joint_angles = np.array([
+    # Training simulation order: FL, FR, RL, RR
+    default_joint_angles_sim = np.array([
         0.1, 0.8, -1.5,   # FL: hip, thigh, calf
         -0.1, 0.8, -1.5,  # FR: hip, thigh, calf
         0.1, 1.0, -1.5,   # RL: hip, thigh, calf
         -0.1, 1.0, -1.5,  # RR: hip, thigh, calf
+    ], dtype=np.float32)
+
+    # SDK/Observation order: FR, FL, RR, RL (matches training after reindex)
+    # This is what the policy actually sees during training
+    default_joint_angles = np.array([
+        -0.1, 0.8, -1.5,  # FR: hip, thigh, calf
+        0.1, 0.8, -1.5,   # FL: hip, thigh, calf
+        -0.1, 1.0, -1.5,  # RR: hip, thigh, calf
+        0.1, 1.0, -1.5,   # RL: hip, thigh, calf
     ], dtype=np.float32)
 
     # Joint order mapping between training (URDF) and Unitree SDK
