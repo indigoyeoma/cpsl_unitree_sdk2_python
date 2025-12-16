@@ -495,6 +495,9 @@ class Go2VisionController:
         self.distance_traveled = 0.0
         self.robot_position = np.zeros(2, dtype=np.float32)
         self.robot_yaw = 0.0
+        # Reset initial heading so it gets set fresh at start of walking
+        if hasattr(self, 'initial_heading'):
+            delattr(self, 'initial_heading')
 
     def _phase_idle(self):
         """Phase IDLE: Damping mode, waiting for Y button."""
@@ -1013,51 +1016,55 @@ class Go2VisionController:
         self.lowcmd_publisher.Write(self.low_cmd)
 
     def _update_goals_and_yaw(self):
-        """Update goals and compute delta_yaw for straight-line walking."""
+        """Update goals and compute delta_yaw for straight-line walking.
+
+        Goal direction is FIXED at initial heading (yaw at start of walking).
+        This gives the policy a yaw error signal when the robot drifts.
+        """
         # Get current robot yaw from IMU
         imu = self.low_state.imu_state
         quat = imu.quaternion  # [w, x, y, z]
 
         # Compute yaw from quaternion (heading angle)
-        # yaw = atan2(2*(w*z + x*y), 1 - 2*(y^2 + z^2))
         self.robot_yaw = np.arctan2(
             2 * (quat[0] * quat[3] + quat[1] * quat[2]),
             1 - 2 * (quat[2]**2 + quat[3]**2)
         )
 
-        # Update robot position by integrating velocity in world frame
-        # Get linear velocity in body frame (from state estimator)
-        # Note: For Go2, we estimate velocity from joint velocities and IMU
-        # Approximation: forward velocity ≈ command_vx * 0.8 (rough estimate)
-        # Better: use actual velocity estimator if available
-        dt = self.policy_dt
-        vel_forward = self.config.command_vx * 0.8  # Approximate actual velocity
+        # Set initial heading on first call (reference direction for walking)
+        if not hasattr(self, 'initial_heading'):
+            self.initial_heading = self.robot_yaw
+            print(f"[NAV] Initial heading set to {np.degrees(self.initial_heading):.1f}°")
 
-        # Convert body-frame velocity to world-frame displacement
+        # Update robot position by integrating velocity in world frame
+        dt = self.policy_dt
+        vel_forward = self.config.command_vx * 0.8
+
         dx = vel_forward * np.cos(self.robot_yaw) * dt
         dy = vel_forward * np.sin(self.robot_yaw) * dt
         self.robot_position += np.array([dx, dy], dtype=np.float32)
 
-        # Keep goal constantly ahead in current heading direction
-        # This makes the robot walk straight forward
-        forward_dir = np.array([np.cos(self.robot_yaw), np.sin(self.robot_yaw)])
-        self.current_goal = self.robot_position + forward_dir * self.config.goal_distance
-        self.next_goal = self.robot_position + forward_dir * self.config.next_goal_distance
+        # Goal direction is FIXED along initial heading (not rotating with robot!)
+        fixed_forward_dir = np.array([np.cos(self.initial_heading), np.sin(self.initial_heading)])
 
-        # Compute target yaw (direction to goal)
+        # Project robot position onto initial heading axis to get forward progress
+        forward_progress = np.dot(self.robot_position, fixed_forward_dir)
+
+        # Place goal ahead along fixed direction
+        self.current_goal = fixed_forward_dir * (forward_progress + self.config.goal_distance)
+        self.next_goal = fixed_forward_dir * (forward_progress + self.config.next_goal_distance)
+
+        # Compute target yaw (direction from robot to goal)
         target_pos_rel = self.current_goal - self.robot_position
         next_target_pos_rel = self.next_goal - self.robot_position
 
         norm = np.linalg.norm(target_pos_rel) + 1e-5
-        target_vec_norm = target_pos_rel / norm
-        target_yaw = np.arctan2(target_vec_norm[1], target_vec_norm[0])
+        target_yaw = np.arctan2(target_pos_rel[1] / norm, target_pos_rel[0] / norm)
 
         norm_next = np.linalg.norm(next_target_pos_rel) + 1e-5
-        next_target_vec_norm = next_target_pos_rel / norm_next
-        next_target_yaw = np.arctan2(next_target_vec_norm[1], next_target_vec_norm[0])
+        next_target_yaw = np.arctan2(next_target_pos_rel[1] / norm_next, next_target_pos_rel[0] / norm_next)
 
-        # Compute delta yaw (yaw error to goal)
-        # Since goal is always ahead in current heading, delta_yaw should be ~0 for straight walking
+        # Compute delta yaw (yaw error to goal) - now NON-ZERO when robot drifts!
         self.delta_yaw = target_yaw - self.robot_yaw
         self.delta_next_yaw = next_target_yaw - self.robot_yaw
 
