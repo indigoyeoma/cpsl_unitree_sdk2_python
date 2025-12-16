@@ -712,22 +712,18 @@ class Go2VisionController:
             # Run policy inference
             action = self.policy.get_action(depth_image, obs)
 
-            # PARKOUR-STYLE ACTION HANDLING:
+            # PARKOUR-STYLE ACTION HANDLING (exactly matching parkour):
             # 1. clip_actions is ONLY for storing last_action in observation
-            # 2. Actual motor commands use torque clipping (in _send_motor_commands)
-            # This matches the reference parkour deployment code
+            # 2. RAW action * scale goes to torque clipping (in _send_command)
 
-            # Clip for observation storage only (matches training observation)
-            clip_limit = self.config.clip_actions / self.config.action_scale  # 4.8
-            action_for_obs = np.clip(action, -clip_limit, clip_limit)
+            # Clip for observation storage only (matches parkour clip_action_before_scale)
+            # Parkour clips to ±clip_actions (1.2), NOT ±(clip_actions/action_scale)
+            action_for_obs = np.clip(action, -self.config.clip_actions, self.config.clip_actions)
 
-            # Scale action (NO pre-clipping for motor commands - torque clipping handles safety)
-            # Training reindexes BOTH observations AND actions to SDK order
+            # Scale RAW action (no pre-clipping, torque clipping handles safety)
+            # Parkour does NOT apply joint limits clipping - only torque clipping
             target_delta = action * self.config.action_scale
             target_pos = self.config.default_joint_angles + target_delta
-
-            # Apply joint limits (position safety)
-            target_pos = JointLimits.clip_joints(target_pos)
 
             self.target_positions = target_pos
 
@@ -742,9 +738,9 @@ class Go2VisionController:
 
             # Print summary every second
             if self.walk_startup_counter % 50 == 0:
-                print(f"  Raw action: {action.min():.2f}/{action.max():.2f} | "
-                      f"Clipped (obs): {action_for_obs.min():.2f}/{action_for_obs.max():.2f} | "
-                      f"{self.distance_traveled:.2f}m")
+                print(f"  Raw: [{action.min():.2f},{action.max():.2f}] | "
+                      f"Obs(±{self.config.clip_actions:.1f}): [{action_for_obs.min():.2f},{action_for_obs.max():.2f}] | "
+                      f"d={self.distance_traveled:.2f}m yaw={np.degrees(self.delta_yaw):.1f}°")
 
     def _log_walk_data(self, depth_image, obs, action_raw, action_clipped, target_pos):
         """Log comprehensive walking data to file for analysis."""
@@ -900,9 +896,9 @@ class Go2VisionController:
             f.write(f"  RR: [{action_raw[6]:.4f}, {action_raw[7]:.4f}, {action_raw[8]:.4f}]\n")
             f.write(f"  RL: [{action_raw[9]:.4f}, {action_raw[10]:.4f}, {action_raw[11]:.4f}]\n")
             f.write(f"  Raw Range: [{action_raw.min():.4f}, {action_raw.max():.4f}]\n")
-            f.write(f"\n--- Clipped Action (for observation only) ---\n")
+            f.write(f"\n--- Clipped Action (for observation only, matches parkour) ---\n")
             f.write(f"  Clipped Range: [{action_clipped.min():.4f}, {action_clipped.max():.4f}]\n")
-            f.write(f"  (clip_limit = ±{self.config.clip_actions / self.config.action_scale:.1f})\n")
+            f.write(f"  (clip_limit = ±{self.config.clip_actions:.1f})\n")
 
             # ===== TARGET POSITIONS =====
             f.write(f"\n--- Target Position (SDK order) ---\n")
