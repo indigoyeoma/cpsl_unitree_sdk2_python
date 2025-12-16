@@ -444,35 +444,48 @@ class Go2VisionController:
                 self.phase = self.PHASE_STAND_TO_SIT
                 self.percent_stand_to_sit = 0.0
 
-        # L1 button: Start walking (from STANDING)
+        # L1 button: Enter debug mode (from STANDING) - TEMPORARILY FOR TESTING
         if self._check_l1_pressed():
             if self.phase == self.PHASE_STANDING:
-                print("\n[L1] Starting walking policy...")
-                self.phase = self.PHASE_WALKING
-                self.walk_startup_counter = 0
-                self.last_policy_time = time.time()
-                self._reset_walk_state()
-                print("\n" + "=" * 60)
-                print(f"WALKING MODE - Velocity: {self.config.command_vx} m/s")
-                print("  Press Y to stop and stand")
-                print("  Press L2/R2 for EMERGENCY STOP")
-                print("=" * 60 + "\n")
-
-        # A button: Enter debug mode (from STANDING)
-        if self._check_a_pressed():
-            if self.phase == self.PHASE_STANDING:
-                print("\n[A] Entering DEBUG MODE...")
+                print("\n[L1] Entering DEBUG MODE (L1 remapped for testing)...")
                 self.phase = self.PHASE_DEBUG
                 self.debug_counter = 0
-                self._reset_walk_state()
+                # Clear the debug file at start
+                open("debug_output.txt", "w").close()
                 print("\n" + "=" * 60)
-                print("DEBUG MODE - Printing sensor data, NO motor control")
-                print("  Press Y to exit debug mode")
+                print("DEBUG MODE - Printing sensor data, holding standing pose")
+                print("  Output saved to: debug_output.txt")
+                print("  Press A to exit, Y to sit down")
+                print("=" * 60 + "\n")
+
+        # A button: Enter/exit debug mode (from STANDING or WALKING)
+        if self._check_a_pressed():
+            if self.phase == self.PHASE_STANDING:
+                print("\n[A] Entering DEBUG MODE (from standing)...")
+                self.phase = self.PHASE_DEBUG
+                self.debug_counter = 0
+                open("debug_output.txt", "w").close()  # Clear file
+                print("\n" + "=" * 60)
+                print("DEBUG MODE - Printing sensor data, holding standing pose")
+                print("  Output saved to: debug_output.txt")
+                print("  Press A to exit, Y to sit down")
+                print("=" * 60 + "\n")
+            elif self.phase == self.PHASE_WALKING:
+                print("\n[A] Entering DEBUG MODE (from walking)...")
+                self.phase = self.PHASE_DEBUG
+                self.debug_counter = 0
+                open("debug_output.txt", "w").close()  # Clear file
+                print("\n" + "=" * 60)
+                print("DEBUG MODE - Preserving walk state for inspection")
+                print("  Output saved to: debug_output.txt")
+                print("  last_action will show actual values from walking")
+                print("  Press A to exit, Y to sit down")
                 print("=" * 60 + "\n")
             elif self.phase == self.PHASE_DEBUG:
                 print("\n[A] Exiting debug mode...")
                 self.phase = self.PHASE_STANDING
-                print("\n>>> Press L1 to WALK or A for DEBUG <<<\n")
+                self._reset_walk_state()  # Reset when EXITING debug
+                print("\n>>> Press L1 for DEBUG or Y to SIT DOWN <<<\n")
 
     def _reset_walk_state(self):
         """Reset walking state variables."""
@@ -524,12 +537,22 @@ class Go2VisionController:
             print(">>> Press L1 to WALK, A for DEBUG, or Y to SIT DOWN <<<", end='\r')
 
     def _phase_debug(self):
-        """Phase DEBUG: Print all sensor data without controlling motors."""
+        """Phase DEBUG: Print all sensor data while holding standing pose."""
+        # Always hold standing position in debug mode
+        self.target_positions = self._stand_pos.copy()
+
         self.debug_counter += 1
 
         # Only print every 0.5 seconds (250 iterations at 500Hz)
         if self.debug_counter % 250 != 0:
             return
+
+        # Open file for appending debug output
+        debug_file = open("debug_output.txt", "a")
+
+        def debug_print(msg=""):
+            print(msg)
+            debug_file.write(msg + "\n")
 
         # Get IMU data
         imu = self.low_state.imu_state
@@ -576,71 +599,82 @@ class Go2VisionController:
         # Run policy to get action (but don't apply)
         action = self.policy.get_action(depth_image, obs)
 
-        # Print everything
-        print("\n" + "=" * 70)
-        print("DEBUG OUTPUT")
-        print("=" * 70)
+        # Print everything (and save to file)
+        import datetime
+        debug_print("\n" + "=" * 70)
+        debug_print(f"DEBUG OUTPUT - {datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
+        debug_print("=" * 70)
 
-        print("\n--- IMU ---")
-        print(f"  Quaternion [w,x,y,z]: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]")
-        print(f"  Roll/Pitch/Yaw (deg): [{np.degrees(roll):.1f}, {np.degrees(pitch):.1f}, {np.degrees(yaw):.1f}]")
-        print(f"  Angular Vel (rad/s):  [{ang_vel[0]:.3f}, {ang_vel[1]:.3f}, {ang_vel[2]:.3f}]")
+        debug_print("\n--- IMU ---")
+        debug_print(f"  Quaternion [w,x,y,z]: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]")
+        debug_print(f"  Roll/Pitch/Yaw (deg): [{np.degrees(roll):.1f}, {np.degrees(pitch):.1f}, {np.degrees(yaw):.1f}]")
+        debug_print(f"  Angular Vel (rad/s):  [{ang_vel[0]:.3f}, {ang_vel[1]:.3f}, {ang_vel[2]:.3f}]")
 
-        print("\n--- Joint Positions (SDK order: FR, FL, RR, RL) ---")
-        print(f"  FR: [{joint_pos[0]:.3f}, {joint_pos[1]:.3f}, {joint_pos[2]:.3f}]")
-        print(f"  FL: [{joint_pos[3]:.3f}, {joint_pos[4]:.3f}, {joint_pos[5]:.3f}]")
-        print(f"  RR: [{joint_pos[6]:.3f}, {joint_pos[7]:.3f}, {joint_pos[8]:.3f}]")
-        print(f"  RL: [{joint_pos[9]:.3f}, {joint_pos[10]:.3f}, {joint_pos[11]:.3f}]")
+        debug_print("\n--- Joint Positions (SDK order: FR, FL, RR, RL) ---")
+        debug_print(f"  FR: [{joint_pos[0]:.3f}, {joint_pos[1]:.3f}, {joint_pos[2]:.3f}]")
+        debug_print(f"  FL: [{joint_pos[3]:.3f}, {joint_pos[4]:.3f}, {joint_pos[5]:.3f}]")
+        debug_print(f"  RR: [{joint_pos[6]:.3f}, {joint_pos[7]:.3f}, {joint_pos[8]:.3f}]")
+        debug_print(f"  RL: [{joint_pos[9]:.3f}, {joint_pos[10]:.3f}, {joint_pos[11]:.3f}]")
 
-        print("\n--- Default Joint Angles (SDK order) ---")
+        debug_print("\n--- Default Joint Angles (SDK order) ---")
         d = self.config.default_joint_angles
-        print(f"  FR: [{d[0]:.3f}, {d[1]:.3f}, {d[2]:.3f}]")
-        print(f"  FL: [{d[3]:.3f}, {d[4]:.3f}, {d[5]:.3f}]")
-        print(f"  RR: [{d[6]:.3f}, {d[7]:.3f}, {d[8]:.3f}]")
-        print(f"  RL: [{d[9]:.3f}, {d[10]:.3f}, {d[11]:.3f}]")
+        debug_print(f"  FR: [{d[0]:.3f}, {d[1]:.3f}, {d[2]:.3f}]")
+        debug_print(f"  FL: [{d[3]:.3f}, {d[4]:.3f}, {d[5]:.3f}]")
+        debug_print(f"  RR: [{d[6]:.3f}, {d[7]:.3f}, {d[8]:.3f}]")
+        debug_print(f"  RL: [{d[9]:.3f}, {d[10]:.3f}, {d[11]:.3f}]")
 
-        print("\n--- Joint Position Error (pos - default) ---")
+        debug_print("\n--- Joint Position Error (pos - default) ---")
         err = joint_pos - self.config.default_joint_angles
-        print(f"  FR: [{err[0]:.3f}, {err[1]:.3f}, {err[2]:.3f}]")
-        print(f"  FL: [{err[3]:.3f}, {err[4]:.3f}, {err[5]:.3f}]")
-        print(f"  RR: [{err[6]:.3f}, {err[7]:.3f}, {err[8]:.3f}]")
-        print(f"  RL: [{err[9]:.3f}, {err[10]:.3f}, {err[11]:.3f}]")
+        debug_print(f"  FR: [{err[0]:.3f}, {err[1]:.3f}, {err[2]:.3f}]")
+        debug_print(f"  FL: [{err[3]:.3f}, {err[4]:.3f}, {err[5]:.3f}]")
+        debug_print(f"  RR: [{err[6]:.3f}, {err[7]:.3f}, {err[8]:.3f}]")
+        debug_print(f"  RL: [{err[9]:.3f}, {err[10]:.3f}, {err[11]:.3f}]")
 
-        print("\n--- Foot Forces (FR, FL, RR, RL) ---")
-        print(f"  [{foot_forces[0]:.1f}, {foot_forces[1]:.1f}, {foot_forces[2]:.1f}, {foot_forces[3]:.1f}]")
+        debug_print("\n--- Foot Forces (FR, FL, RR, RL) ---")
+        debug_print(f"  [{foot_forces[0]:.1f}, {foot_forces[1]:.1f}, {foot_forces[2]:.1f}, {foot_forces[3]:.1f}]")
 
-        print("\n--- Depth Image ---")
-        print(f"  Shape: {depth_image.shape}")
-        print(f"  Min/Max: [{depth_image.min():.3f}, {depth_image.max():.3f}]")
-        print(f"  Mean: {depth_image.mean():.3f}")
+        debug_print("\n--- Depth Image ---")
+        debug_print(f"  Shape: {depth_image.shape}")
+        debug_print(f"  Min/Max: [{depth_image.min():.3f}, {depth_image.max():.3f}]")
+        debug_print(f"  Mean: {depth_image.mean():.3f}")
 
-        print("\n--- Policy Action Output (unscaled, SDK order) ---")
-        print(f"  FR: [{action[0]:.3f}, {action[1]:.3f}, {action[2]:.3f}]")
-        print(f"  FL: [{action[3]:.3f}, {action[4]:.3f}, {action[5]:.3f}]")
-        print(f"  RR: [{action[6]:.3f}, {action[7]:.3f}, {action[8]:.3f}]")
-        print(f"  RL: [{action[9]:.3f}, {action[10]:.3f}, {action[11]:.3f}]")
-        print(f"  Action range: [{action.min():.3f}, {action.max():.3f}]")
+        debug_print("\n--- Policy Action Output (unscaled, SDK order) ---")
+        debug_print(f"  FR: [{action[0]:.3f}, {action[1]:.3f}, {action[2]:.3f}]")
+        debug_print(f"  FL: [{action[3]:.3f}, {action[4]:.3f}, {action[5]:.3f}]")
+        debug_print(f"  RR: [{action[6]:.3f}, {action[7]:.3f}, {action[8]:.3f}]")
+        debug_print(f"  RL: [{action[9]:.3f}, {action[10]:.3f}, {action[11]:.3f}]")
+        debug_print(f"  Action range: [{action.min():.3f}, {action.max():.3f}]")
 
-        print("\n--- Proprio Observation (first 53 dims) ---")
-        print(f"  [0:3]   ang_vel*0.25:     [{proprio[0]:.3f}, {proprio[1]:.3f}, {proprio[2]:.3f}]")
-        print(f"  [3:5]   roll,pitch:       [{proprio[3]:.3f}, {proprio[4]:.3f}]")
-        print(f"  [5:8]   yaw stuff:        [{proprio[5]:.3f}, {proprio[6]:.3f}, {proprio[7]:.3f}]")
-        print(f"  [8:11]  cmd stuff:        [{proprio[8]:.3f}, {proprio[9]:.3f}, {proprio[10]:.3f}]")
-        print(f"  [11:13] env_class:        [{proprio[11]:.3f}, {proprio[12]:.3f}]")
-        print(f"  [13:25] dof_pos:          min={proprio[13:25].min():.3f}, max={proprio[13:25].max():.3f}")
-        print(f"  [25:37] dof_vel*0.05:     min={proprio[25:37].min():.3f}, max={proprio[25:37].max():.3f}")
-        print(f"  [37:49] last_action:      min={proprio[37:49].min():.3f}, max={proprio[37:49].max():.3f}")
-        print(f"  [49:53] contacts:         [{proprio[49]:.1f}, {proprio[50]:.1f}, {proprio[51]:.1f}, {proprio[52]:.1f}]")
+        debug_print("\n--- Proprio Observation (first 53 dims) ---")
+        debug_print(f"  [0:3]   ang_vel*0.25:     [{proprio[0]:.3f}, {proprio[1]:.3f}, {proprio[2]:.3f}]")
+        debug_print(f"  [3:5]   roll,pitch:       [{proprio[3]:.3f}, {proprio[4]:.3f}]")
+        debug_print(f"  [5:8]   yaw stuff:        [{proprio[5]:.3f}, {proprio[6]:.3f}, {proprio[7]:.3f}]")
+        debug_print(f"  [8:11]  cmd stuff:        [{proprio[8]:.3f}, {proprio[9]:.3f}, {proprio[10]:.3f}]")
+        debug_print(f"  [11:13] env_class:        [{proprio[11]:.3f}, {proprio[12]:.3f}]")
+        debug_print(f"  [13:25] dof_pos:          min={proprio[13:25].min():.3f}, max={proprio[13:25].max():.3f}")
+        debug_print(f"  [25:37] dof_vel*0.05:     min={proprio[25:37].min():.3f}, max={proprio[25:37].max():.3f}")
+        debug_print(f"  [49:53] contacts:         [{proprio[49]:.1f}, {proprio[50]:.1f}, {proprio[51]:.1f}, {proprio[52]:.1f}]")
 
-        print("\n--- Target Position (if walking) ---")
+        debug_print("\n--- Last Action (from self.last_action, SDK order) ---")
+        la = self.last_action
+        debug_print(f"  FR: [{la[0]:.3f}, {la[1]:.3f}, {la[2]:.3f}]")
+        debug_print(f"  FL: [{la[3]:.3f}, {la[4]:.3f}, {la[5]:.3f}]")
+        debug_print(f"  RR: [{la[6]:.3f}, {la[7]:.3f}, {la[8]:.3f}]")
+        debug_print(f"  RL: [{la[9]:.3f}, {la[10]:.3f}, {la[11]:.3f}]")
+        debug_print(f"  (zeros = entered from standing, non-zero = entered from walking)")
+
+        debug_print("\n--- Target Position (if walking) ---")
         target = self.config.default_joint_angles + action * self.config.action_scale
-        print(f"  FR: [{target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f}]")
-        print(f"  FL: [{target[3]:.3f}, {target[4]:.3f}, {target[5]:.3f}]")
-        print(f"  RR: [{target[6]:.3f}, {target[7]:.3f}, {target[8]:.3f}]")
-        print(f"  RL: [{target[9]:.3f}, {target[10]:.3f}, {target[11]:.3f}]")
+        debug_print(f"  FR: [{target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f}]")
+        debug_print(f"  FL: [{target[3]:.3f}, {target[4]:.3f}, {target[5]:.3f}]")
+        debug_print(f"  RR: [{target[6]:.3f}, {target[7]:.3f}, {target[8]:.3f}]")
+        debug_print(f"  RL: [{target[9]:.3f}, {target[10]:.3f}, {target[11]:.3f}]")
 
-        print("\n>>> Press A to exit DEBUG, Y to sit down <<<")
-        print("=" * 70)
+        debug_print("\n>>> Press A to exit DEBUG, Y to sit down <<<")
+        debug_print("=" * 70)
+
+        # Close debug file
+        debug_file.close()
 
     def _phase_walk(self):
         """Phase WALKING: Run vision policy for walking."""
