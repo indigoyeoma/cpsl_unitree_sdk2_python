@@ -71,19 +71,26 @@ class Go2VisionController:
     PHASE_STAND_TO_SIT = 4
     PHASE_EMERGENCY = 5
 
-    # Button constants (from parkour unitree_ros2_real.py)
-    BUTTON_R1 = 0b00000001
-    BUTTON_L1 = 0b00000010
-    BUTTON_START = 0b00000100
-    BUTTON_SELECT = 0b00001000
-    BUTTON_R2 = 0b00010000
-    BUTTON_L2 = 0b00100000
-    BUTTON_F1 = 0b01000000
-    BUTTON_F2 = 0b10000000
-    BUTTON_A = 0b100000000
-    BUTTON_B = 0b1000000000
-    BUTTON_X = 0b10000000000
-    BUTTON_Y = 0b100000000000
+    # Button constants (from SDK wireless_controller.py)
+    # Byte 2 (data1): R1, L1, Start, Select, R2, L2, F1, F3
+    # Byte 3 (data2): A, B, X, Y, Up, Right, Down, Left
+    # We combine as: data1 | (data2 << 8)
+    BUTTON_R1 = 1 << 0       # data1 bit 0
+    BUTTON_L1 = 1 << 1       # data1 bit 1
+    BUTTON_START = 1 << 2   # data1 bit 2
+    BUTTON_SELECT = 1 << 3  # data1 bit 3
+    BUTTON_R2 = 1 << 4       # data1 bit 4
+    BUTTON_L2 = 1 << 5       # data1 bit 5
+    BUTTON_F1 = 1 << 6       # data1 bit 6
+    BUTTON_F3 = 1 << 7       # data1 bit 7
+    BUTTON_A = 1 << 8        # data2 bit 0
+    BUTTON_B = 1 << 9        # data2 bit 1
+    BUTTON_X = 1 << 10       # data2 bit 2
+    BUTTON_Y = 1 << 11       # data2 bit 3
+    BUTTON_UP = 1 << 12      # data2 bit 4
+    BUTTON_RIGHT = 1 << 13   # data2 bit 5
+    BUTTON_DOWN = 1 << 14    # data2 bit 6
+    BUTTON_LEFT = 1 << 15    # data2 bit 7
 
     def __init__(self, policy: JITPolicyRunner, camera, config: DeployConfig,
                  skip_standup: bool = False):
@@ -294,15 +301,17 @@ class Go2VisionController:
         print("✓ Control stopped")
 
     def _get_button_state(self):
-        """Get current button state from wireless remote (parkour-style)."""
+        """Get current button state from wireless remote (SDK format)."""
         if self.low_state is None:
             return 0
 
-        # wireless_remote is a bytes array, parse as 16-bit button mask
-        # Based on parkour unitree_ros2_real.py WirelessButtons
+        # wireless_remote format (from SDK wireless_controller.py):
+        # Byte 2 (data1): R1, L1, Start, Select, R2, L2, F1, F3
+        # Byte 3 (data2): A, B, X, Y, Up, Right, Down, Left
         wireless_remote = self.low_state.wireless_remote
-        # Combine bytes to get full button state
-        buttons = wireless_remote[0] | (wireless_remote[1] << 8)
+        data1 = wireless_remote[2]  # Buttons byte 1
+        data2 = wireless_remote[3]  # Buttons byte 2
+        buttons = data1 | (data2 << 8)
         return buttons
 
     def _check_button_pressed(self, button_mask):
