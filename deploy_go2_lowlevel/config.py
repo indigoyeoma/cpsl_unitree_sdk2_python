@@ -12,7 +12,7 @@ class DeployConfig:
     # Control parameters (must match training config)
     control_dt = 0.02  # 50Hz policy (decimation=4 @ 200Hz sim)
     action_scale = 0.25
-    clip_actions = 0.5  # Action clipping (conservative for testing, training uses 1.2)
+    clip_actions = 1.2  # Action clipping (matches training - ±4.8 raw → ±1.2 rad)
 
     # PD gains for WALKING (must match training for sim2real)
     # Training used: kp=25.0, kd=0.6 (from go2_config.py)
