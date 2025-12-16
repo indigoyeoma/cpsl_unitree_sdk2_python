@@ -1066,10 +1066,10 @@ class Go2VisionController:
         next_target_yaw = np.arctan2(next_target_pos_rel[1] / norm_next, next_target_pos_rel[0] / norm_next)
 
         # Compute delta yaw - NON-ZERO when robot drifts off the line!
-        # Positive delta_yaw = goal is to the left, robot should turn left
-        # Negative delta_yaw = goal is to the right, robot should turn right
-        self.delta_yaw = target_yaw - self.robot_yaw
-        self.delta_next_yaw = next_target_yaw - self.robot_yaw
+        # CPSL uses opposite sign convention: positive delta_yaw = turn right
+        # So we negate: robot_yaw - target_yaw
+        self.delta_yaw = self.robot_yaw - target_yaw
+        self.delta_next_yaw = self.robot_yaw - next_target_yaw
 
         # Wrap angles to [-pi, pi]
         self.delta_yaw = np.arctan2(np.sin(self.delta_yaw), np.cos(self.delta_yaw))
