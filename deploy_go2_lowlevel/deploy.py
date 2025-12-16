@@ -712,40 +712,41 @@ class Go2VisionController:
             # Run policy inference
             action = self.policy.get_action(depth_image, obs)
 
-            # Clip actions (must match training: clip to clip_actions/action_scale before scaling)
-            # Training clips raw policy output to ±(1.2/0.25) = ±4.8, then scales by 0.25
+            # PARKOUR-STYLE ACTION HANDLING:
+            # 1. clip_actions is ONLY for storing last_action in observation
+            # 2. Actual motor commands use torque clipping (in _send_motor_commands)
+            # This matches the reference parkour deployment code
+
+            # Clip for observation storage only (matches training observation)
             clip_limit = self.config.clip_actions / self.config.action_scale  # 4.8
-            action = np.clip(action, -clip_limit, clip_limit)
+            action_for_obs = np.clip(action, -clip_limit, clip_limit)
 
-            # NO CONVERSION NEEDED!
-            # Training reindexes BOTH observations AND actions to SDK order before applying.
-            # So policy outputs in SDK order (FR, FL, RR, RL), same as our SDK motors.
-
-            # Scale action and add to default pose (both in SDK order)
+            # Scale action (NO pre-clipping for motor commands - torque clipping handles safety)
+            # Training reindexes BOTH observations AND actions to SDK order
             target_delta = action * self.config.action_scale
             target_pos = self.config.default_joint_angles + target_delta
 
-            # Apply joint limits
+            # Apply joint limits (position safety)
             target_pos = JointLimits.clip_joints(target_pos)
 
             self.target_positions = target_pos
 
-            # Update history - store action for observation (already in SDK order)
-            self.last_action = action
-            self.action_history.append(action)
+            # Store CLIPPED action for observation (last_action in next obs)
+            self.last_action = action_for_obs
+            self.action_history.append(action_for_obs)
 
             # Log data every 10 policy steps (5 times per second)
             self.walk_startup_counter += 1
             if self.walk_startup_counter % 10 == 0:
-                self._log_walk_data(depth_image, obs, action, target_pos)
+                self._log_walk_data(depth_image, obs, action, action_for_obs, target_pos)
 
             # Print summary every second
             if self.walk_startup_counter % 50 == 0:
-                print(f"  Action min/max: {action.min():.2f}/{action.max():.2f} | "
-                      f"Depth min/max: {depth_image.min():.2f}/{depth_image.max():.2f} | "
+                print(f"  Raw action: {action.min():.2f}/{action.max():.2f} | "
+                      f"Clipped (obs): {action_for_obs.min():.2f}/{action_for_obs.max():.2f} | "
                       f"{self.distance_traveled:.2f}m")
 
-    def _log_walk_data(self, depth_image, obs, action, target_pos):
+    def _log_walk_data(self, depth_image, obs, action_raw, action_clipped, target_pos):
         """Log comprehensive walking data to file for analysis."""
         import datetime
 
@@ -893,12 +894,15 @@ class Go2VisionController:
                 f.write(f"  [Saved full depth to: depth_image_sample.npy]\n")
 
             # ===== ACTION (SDK order - no conversion needed) =====
-            f.write(f"\n--- Action (SDK order: FR,FL,RR,RL) ---\n")
-            f.write(f"  FR: [{action[0]:.4f}, {action[1]:.4f}, {action[2]:.4f}]\n")
-            f.write(f"  FL: [{action[3]:.4f}, {action[4]:.4f}, {action[5]:.4f}]\n")
-            f.write(f"  RR: [{action[6]:.4f}, {action[7]:.4f}, {action[8]:.4f}]\n")
-            f.write(f"  RL: [{action[9]:.4f}, {action[10]:.4f}, {action[11]:.4f}]\n")
-            f.write(f"  Range: [{action.min():.4f}, {action.max():.4f}]\n")
+            f.write(f"\n--- Raw Action (SDK order: FR,FL,RR,RL) - sent to motors via torque clip ---\n")
+            f.write(f"  FR: [{action_raw[0]:.4f}, {action_raw[1]:.4f}, {action_raw[2]:.4f}]\n")
+            f.write(f"  FL: [{action_raw[3]:.4f}, {action_raw[4]:.4f}, {action_raw[5]:.4f}]\n")
+            f.write(f"  RR: [{action_raw[6]:.4f}, {action_raw[7]:.4f}, {action_raw[8]:.4f}]\n")
+            f.write(f"  RL: [{action_raw[9]:.4f}, {action_raw[10]:.4f}, {action_raw[11]:.4f}]\n")
+            f.write(f"  Raw Range: [{action_raw.min():.4f}, {action_raw.max():.4f}]\n")
+            f.write(f"\n--- Clipped Action (for observation only) ---\n")
+            f.write(f"  Clipped Range: [{action_clipped.min():.4f}, {action_clipped.max():.4f}]\n")
+            f.write(f"  (clip_limit = ±{self.config.clip_actions / self.config.action_scale:.1f})\n")
 
             # ===== TARGET POSITIONS =====
             f.write(f"\n--- Target Position (SDK order) ---\n")
