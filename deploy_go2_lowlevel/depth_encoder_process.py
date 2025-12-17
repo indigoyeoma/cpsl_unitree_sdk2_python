@@ -162,9 +162,18 @@ def depth_encoder_loop(
             shared_embedding[i] = embedding[i]
 
         # Also write yaw prediction (last 2 dims of output, scaled by 1.5 like parkour)
-        yaw_pred = output[0, 32:34].numpy() * 1.5
-        shared_embedding[32] = yaw_pred[0]  # delta_yaw_sin
-        shared_embedding[33] = yaw_pred[1]  # delta_yaw_cos
+        # NOTE: Set to 0 for flat ground testing (no visual target to navigate toward)
+        # For terrain with obstacles, enable the encoder output
+        USE_YAW_PREDICTION = False  # Set True when testing with obstacles/terrain
+
+        if USE_YAW_PREDICTION:
+            yaw_pred = output[0, 32:34].numpy() * 1.5
+            shared_embedding[32] = -yaw_pred[0]  # delta_yaw_sin (negated)
+            shared_embedding[33] = yaw_pred[1]   # delta_yaw_cos
+        else:
+            # Zero yaw prediction - robot walks straight based on cmd_vel only
+            shared_embedding[32] = 0.0
+            shared_embedding[33] = 0.0
 
         embedding_ready.value = True
 
