@@ -3,9 +3,9 @@
 Go2 Vision Policy Deployment Script
 
 Controls:
-    Y:  Stand up (from any state)
-    L1: Enable walking policy (only when standing)
-    R2: EMERGENCY STOP - cuts all motor power
+    Y:  Stand up (from IDLE) / Reset policy (when walking)
+    L1: Enable walking policy (when standing)
+    R2/L2: EMERGENCY STOP - cuts all motor power
 
 Usage:
     python deploy.py                    # Normal mode
@@ -97,10 +97,9 @@ class Go2Deployment:
         self.target_pos = DEFAULT_STAND_ANGLES_SDK.copy()
         self.current_target = DEFAULT_STAND_ANGLES_SDK.copy()
 
-        # Button state (for edge detection)
-        self.prev_buttons = 0
-        self.button_pressed = {}
-        self.button_hold_time = {}  # Track how long buttons are held
+        # Gradual standing parameters (matches parkour's ZeroActModel)
+        self.stand_delta = 0.2  # Step size toward target
+        self.stand_tolerance = 0.15  # Close enough threshold
 
         # Components
         self.camera: Optional[DepthCamera] = None
@@ -227,10 +226,12 @@ class Go2Deployment:
         print("=" * 60)
         print("Initialization complete!")
         print()
-        print("Controls:")
-        print("  Y:  Stand up")
+        print("Controls (matching parkour):")
+        print("  Y:  Stand up (from IDLE) / Reset policy (when walking)")
         print("  L1: Enable walking policy (when standing)")
-        print("  R2: EMERGENCY STOP")
+        print("  R2/L2: EMERGENCY STOP")
+        print()
+        print("State flow: IDLE --(Y)--> STANDING --(L1)--> WALKING --(Y)--> STANDING")
         print("=" * 60)
         print()
 
@@ -344,7 +345,8 @@ class Go2Deployment:
         remote = state.wireless_remote
         buttons_raw = remote[2] | (remote[3] << 8)
         self.log_file.write(f"\n[Buttons]\n")
-        self.log_file.write(f"  raw=0x{buttons_raw:04X}, pressed={self.button_pressed}\n")
+        self.log_file.write(f"  raw=0x{buttons_raw:04X}\n")
+        self.log_file.write(f"  Y={bool(buttons_raw & self.WirelessButtons.Y)}, L1={bool(buttons_raw & self.WirelessButtons.L1)}, R2={bool(buttons_raw & self.WirelessButtons.R2)}\n")
 
         # Depth stats
         if depth_stats:
@@ -417,77 +419,67 @@ class Go2Deployment:
         """Callback for low-level state messages."""
         self.low_state = msg
 
-    def _parse_buttons(self) -> dict:
-        """
-        Parse button states from wireless remote.
+    # Button masks (matching parkour's WirelessButtons)
+    class WirelessButtons:
+        R1 = 0b00000001          # 1
+        L1 = 0b00000010          # 2
+        start = 0b00000100       # 4
+        select = 0b00001000      # 8
+        R2 = 0b00010000          # 16
+        L2 = 0b00100000          # 32
+        F1 = 0b01000000          # 64
+        F2 = 0b10000000          # 128
+        A = 0b100000000          # 256
+        B = 0b1000000000         # 512
+        X = 0b10000000000        # 1024
+        Y = 0b100000000000       # 2048
 
-        Returns:
-            Dict of button states with edge detection
+    def _get_buttons(self) -> int:
+        """
+        Get current button bitmask from wireless remote.
+        Matches parkour's msg.keys format.
         """
         if self.low_state is None:
-            return {}
-
+            return 0
         remote = self.low_state.wireless_remote
-        data1 = remote[2]
-        data2 = remote[3]
-        buttons = data1 | (data2 << 8)
+        return remote[2] | (remote[3] << 8)
 
-        # Button masks
-        BUTTON_R1 = 1 << 0
-        BUTTON_L1 = 1 << 1
-        BUTTON_R2 = 1 << 4
-        BUTTON_L2 = 1 << 5
-        BUTTON_A = 1 << 8
-        BUTTON_B = 1 << 9
-        BUTTON_X = 1 << 10
-        BUTTON_Y = 1 << 11
+    def _compute_gradual_stand_action(self) -> np.ndarray:
+        """
+        Compute gradual standing action like parkour's ZeroActModel.
+        Moves joints toward DEFAULT_STAND_ANGLES_SDK with controlled delta.
 
-        # Current button states (level detection for responsiveness)
-        y_pressed = bool(buttons & BUTTON_Y)
-        l1_pressed = bool(buttons & BUTTON_L1)
-        r2_pressed = bool(buttons & BUTTON_R2)
-        a_pressed = bool(buttons & BUTTON_A)
-        b_pressed = bool(buttons & BUTTON_B)
+        Returns:
+            Joint position targets in SDK order [12]
+        """
+        if self.low_state is None:
+            return DEFAULT_STAND_ANGLES_SDK.copy()
 
-        # Previous states
-        y_was_pressed = bool(self.prev_buttons & BUTTON_Y)
-        l1_was_pressed = bool(self.prev_buttons & BUTTON_L1)
-        a_was_pressed = bool(self.prev_buttons & BUTTON_A)
-        b_was_pressed = bool(self.prev_buttons & BUTTON_B)
+        # Get current joint positions
+        dof_pos = np.array([
+            self.low_state.motor_state[i].q for i in range(12)
+        ], dtype=np.float32)
 
-        # Track hold times for responsive button detection
-        current_time = time.time()
-        HOLD_THRESHOLD = 0.1  # Trigger after holding 100ms
+        target = DEFAULT_STAND_ANGLES_SDK.copy()
+        diff = dof_pos - target
 
-        for btn, pressed in [('Y', y_pressed), ('L1', l1_pressed)]:
-            if pressed:
-                if btn not in self.button_hold_time:
-                    self.button_hold_time[btn] = current_time
-            else:
-                self.button_hold_time.pop(btn, None)
+        # For joints far from target, move by delta toward target
+        diff_large_mask = np.abs(diff) > self.stand_tolerance
+        target[diff_large_mask] = dof_pos[diff_large_mask] - self.stand_delta * np.sign(diff[diff_large_mask])
 
-        # Rising edge OR held long enough triggers action
-        y_trigger = (y_pressed and not y_was_pressed) or \
-                    (y_pressed and self.button_hold_time.get('Y', current_time) <= current_time - HOLD_THRESHOLD)
-        l1_trigger = (l1_pressed and not l1_was_pressed) or \
-                     (l1_pressed and self.button_hold_time.get('L1', current_time) <= current_time - HOLD_THRESHOLD)
+        return target
 
-        # Clear hold time after triggering to prevent repeated triggers
-        if y_trigger and 'Y' in self.button_hold_time:
-            self.button_hold_time['Y'] = current_time + 1.0  # Prevent re-trigger for 1 second
-        if l1_trigger and 'L1' in self.button_hold_time:
-            self.button_hold_time['L1'] = current_time + 1.0
+    def _is_at_stand_position(self) -> bool:
+        """Check if robot is at stand position (all joints within tolerance)."""
+        if self.low_state is None:
+            return False
 
-        self.button_pressed = {
-            'Y': y_trigger,
-            'L1': l1_trigger,
-            'R2': r2_pressed,  # Level detection for emergency (always active when held)
-            'A': a_pressed and not a_was_pressed,
-            'B': b_pressed and not b_was_pressed,
-        }
+        dof_pos = np.array([
+            self.low_state.motor_state[i].q for i in range(12)
+        ], dtype=np.float32)
 
-        self.prev_buttons = buttons
-        return self.button_pressed
+        diff = np.abs(dof_pos - DEFAULT_STAND_ANGLES_SDK)
+        return np.all(diff <= self.stand_tolerance)
 
     def _enter_state(self, new_state: State):
         """Transition to a new state."""
@@ -616,11 +608,11 @@ class Go2Deployment:
 
         self.tick += 1
 
-        # Parse button inputs
-        buttons = self._parse_buttons()
+        # Get button bitmask (simple bitwise like parkour)
+        buttons = self._get_buttons()
 
-        # Emergency stop takes priority - LATCHING (once triggered, stays until restart)
-        if buttons.get('R2', False) or self.state == State.EMERGENCY:
+        # Emergency stop takes priority - LATCHING (R2 or L2)
+        if (buttons & self.WirelessButtons.R2) or (buttons & self.WirelessButtons.L2) or self.state == State.EMERGENCY:
             if self.state != State.EMERGENCY:
                 self._enter_state(State.EMERGENCY)
             self._send_emergency_stop()
@@ -632,29 +624,28 @@ class Go2Deployment:
             self._send_motor_commands(
                 self.current_target, kp=0.0, kd=KD_STAND
             )
-            if buttons.get('Y', False):
+            # Y to start standing up
+            if buttons & self.WirelessButtons.Y:
                 self._enter_state(State.STANDING_UP)
 
         elif self.state == State.STANDING_UP:
-            duration = self._get_state_duration()
-            progress = min(1.0, duration / STAND_UP_DURATION)
-
-            # Smooth interpolation (ease-in-out)
-            t = progress * progress * (3 - 2 * progress)
-            self.current_target = (1 - t) * self.start_pos + t * self.target_pos
-
+            # Gradual standing like parkour's ZeroActModel
+            self.current_target = self._compute_gradual_stand_action()
             self._send_motor_commands(self.current_target, KP_STAND, KD_STAND)
 
-            if progress >= 1.0:
+            # Check if at stand position
+            if self._is_at_stand_position():
+                print("  Standing complete - press L1 to start walking")
                 self._enter_state(State.STANDING)
 
         elif self.state == State.STANDING:
-            self._send_motor_commands(DEFAULT_STAND_ANGLES_SDK, KP_STAND, KD_STAND)
+            # Hold at stand position with gradual correction
+            self.current_target = self._compute_gradual_stand_action()
+            self._send_motor_commands(self.current_target, KP_STAND, KD_STAND)
 
-            if buttons.get('L1', False):
+            # L1 to start walking (like parkour)
+            if buttons & self.WirelessButtons.L1:
                 self._enter_state(State.WALKING)
-            elif buttons.get('Y', False):
-                self._enter_state(State.IDLE)
 
         elif self.state == State.WALKING:
             # Run policy at 50Hz
@@ -664,7 +655,10 @@ class Go2Deployment:
 
             self._send_motor_commands(self.current_target, KP_WALK, KD_WALK)
 
-            if buttons.get('Y', False):
+            # Y to reset policy (like parkour) - goes back to standing
+            if buttons & self.WirelessButtons.Y:
+                self.policy.reset()
+                print("  Policy reset - returning to stand")
                 self._enter_state(State.STANDING)
 
         elif self.state == State.EMERGENCY:
