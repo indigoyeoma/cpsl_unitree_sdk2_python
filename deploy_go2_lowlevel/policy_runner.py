@@ -160,6 +160,12 @@ class PolicyRunner:
 
             # GPU warmup - first inference is slow due to CUDA memory allocation
             print("Running GPU warmup...")
+            print(f"  Device: {self.device}")
+            print(f"  CUDA available: {torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                print(f"  CUDA device: {torch.cuda.get_device_name(0)}")
+                print(f"  CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
             dummy_depth = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
             dummy_ang_vel = np.zeros(3, dtype=np.float32)
             dummy_dof_pos = DEFAULT_STAND_ANGLES_SDK.copy()
@@ -169,12 +175,19 @@ class PolicyRunner:
             import time
             for i in range(5):
                 t0 = time.time()
-                self.run_inference(
-                    dummy_depth, dummy_ang_vel, 0.0, 0.0,
-                    dummy_dof_pos, dummy_dof_vel, dummy_contacts, 0.5
-                )
+                # Time each component
+                proprio = self.build_proprio_obs(dummy_ang_vel, 0.0, 0.0, dummy_dof_pos, dummy_dof_vel, dummy_contacts, 0.5)
                 t1 = time.time()
-                print(f"  Warmup {i+1}/5: {(t1-t0)*1000:.1f}ms")
+                obs = self.build_full_obs(proprio)
+                t2 = time.time()
+                depth_latent = self.get_depth_latent(dummy_depth, proprio)
+                t3 = time.time()
+                targets, _ = self.get_action(obs, depth_latent)
+                t4 = time.time()
+
+                print(f"  Warmup {i+1}/5: total={((t4-t0)*1000):.1f}ms | "
+                      f"proprio={((t1-t0)*1000):.1f}ms, obs={((t2-t1)*1000):.1f}ms, "
+                      f"depth_enc={((t3-t2)*1000):.1f}ms, policy={((t4-t3)*1000):.1f}ms")
 
             self.reset()  # Reset history after warmup
             print("GPU warmup complete")
