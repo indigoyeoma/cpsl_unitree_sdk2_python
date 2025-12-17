@@ -156,26 +156,33 @@ def save_images(raw_depth, filtered_depth, output_dir=".", prefix="depth"):
     print(f"  Mean: {processed.mean():.4f}")
 
     if HAS_CV2:
-        # 4. Save raw as visualization (scaled to 0-255)
+        # 4. Save raw as grayscale visualization (scaled to 0-255)
         raw_vis = (raw_depth.astype(np.float32) / raw_depth.max() * 255).astype(np.uint8)
-        raw_vis_path = os.path.join(output_dir, f"{prefix}_raw_vis_{timestamp}.png")
+        raw_vis_path = os.path.join(output_dir, f"{prefix}_raw_grayscale_{timestamp}.png")
         cv2.imwrite(raw_vis_path, raw_vis)
         saved_files.append(raw_vis_path)
-        print(f"\nSaved raw visualization: {raw_vis_path}")
+        print(f"\nSaved raw grayscale: {raw_vis_path}")
 
-        # 5. Save processed as visualization
+        # 5. Save raw as COLOR visualization (JET colormap)
+        raw_color = cv2.applyColorMap(raw_vis, cv2.COLORMAP_JET)
+        raw_color_path = os.path.join(output_dir, f"{prefix}_raw_COLOR_{timestamp}.png")
+        cv2.imwrite(raw_color_path, raw_color)
+        saved_files.append(raw_color_path)
+        print(f"Saved raw COLOR: {raw_color_path}")
+
+        # 6. Save processed as grayscale visualization
         processed_vis = (processed * 255).astype(np.uint8)
-        processed_vis_path = os.path.join(output_dir, f"{prefix}_processed_vis_{timestamp}.png")
+        processed_vis_path = os.path.join(output_dir, f"{prefix}_processed_grayscale_{timestamp}.png")
         cv2.imwrite(processed_vis_path, processed_vis)
         saved_files.append(processed_vis_path)
-        print(f"Saved processed visualization: {processed_vis_path}")
+        print(f"Saved processed grayscale: {processed_vis_path}")
 
-        # 6. Save colorized version for better visualization
-        colorized = cv2.applyColorMap(processed_vis, cv2.COLORMAP_JET)
-        colorized_path = os.path.join(output_dir, f"{prefix}_colorized_{timestamp}.png")
-        cv2.imwrite(colorized_path, colorized)
-        saved_files.append(colorized_path)
-        print(f"Saved colorized visualization: {colorized_path}")
+        # 7. Save processed as COLOR visualization (JET colormap) - THIS IS WHAT POLICY SEES
+        processed_color = cv2.applyColorMap(processed_vis, cv2.COLORMAP_JET)
+        processed_color_path = os.path.join(output_dir, f"{prefix}_processed_COLOR_{timestamp}.png")
+        cv2.imwrite(processed_color_path, processed_color)
+        saved_files.append(processed_color_path)
+        print(f"Saved processed COLOR (policy input): {processed_color_path}")
 
     return saved_files
 
