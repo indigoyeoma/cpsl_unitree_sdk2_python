@@ -124,6 +124,16 @@ class Go2VisionController:
             'L2': False,
             'R2': False,
         }
+        # Button hold counters for debouncing and held detection
+        self.button_hold_count = {
+            'Y': 0,
+            'L1': 0,
+            'A': 0,
+            'B': 0,
+            'L2': 0,
+            'R2': 0,
+        }
+        self.BUTTON_HOLD_THRESHOLD = 3  # Trigger after 3 cycles (~6ms at 500Hz)
 
         # Observation buffers
         self.obs_history = deque(maxlen=config.history_len)
@@ -332,15 +342,15 @@ class Go2VisionController:
         return buttons
 
     def _update_button_buffer(self):
-        """Update button buffer with latching (like parkour).
+        """Update button buffer with hold detection (more responsive than edge-only).
 
-        Detects rising edges and latches them in the buffer.
-        Buttons stay latched until explicitly consumed by _consume_button().
-        This ensures button presses are never missed even if brief.
+        Uses both rising edge AND hold detection:
+        - Rising edge: immediate latch on press
+        - Hold detection: latch after button held for BUTTON_HOLD_THRESHOLD cycles
+        This ensures button presses are never missed even with slow state updates.
         """
         buttons = self._get_button_state()
 
-        # Check each button for rising edge (pressed now, wasn't before)
         button_map = {
             'Y': self.BUTTON_Y,
             'L1': self.BUTTON_L1,
@@ -351,9 +361,20 @@ class Go2VisionController:
         }
 
         for name, mask in button_map.items():
-            # Rising edge detection: pressed now but wasn't before
-            if (buttons & mask) and not (self.prev_buttons & mask):
-                self.button_buffer[name] = True
+            if buttons & mask:
+                # Button is pressed - increment hold counter
+                self.button_hold_count[name] += 1
+
+                # Latch on rising edge OR after hold threshold
+                if not (self.prev_buttons & mask):
+                    # Rising edge - immediate latch
+                    self.button_buffer[name] = True
+                elif self.button_hold_count[name] >= self.BUTTON_HOLD_THRESHOLD:
+                    # Held long enough - latch (catches missed rising edges)
+                    self.button_buffer[name] = True
+            else:
+                # Button released - reset hold counter
+                self.button_hold_count[name] = 0
 
         # Update previous state for next iteration
         self.prev_buttons = buttons
@@ -374,15 +395,28 @@ class Go2VisionController:
         return self.button_buffer.get(name, False)
 
     def _check_emergency_stop(self):
-        """Check L2/R2 buttons for emergency stop (from parkour).
+        """Check L2/R2 buttons for emergency stop - INSTANT response.
 
-        Emergency stop checks the live button state AND the buffer
-        to ensure we never miss an emergency stop request.
+        Emergency stop uses multiple detection methods:
+        1. Live button state (immediate)
+        2. Hold counter (catches slow updates)
+        3. Buffer (catches brief presses)
+
+        Returns True if ANY method detects L2 or R2.
         """
         buttons = self._get_button_state()
-        live_pressed = (buttons & self.BUTTON_L2) or (buttons & self.BUTTON_R2)
+
+        # Method 1: Live button state (immediate)
+        live_pressed = bool(buttons & self.BUTTON_L2) or bool(buttons & self.BUTTON_R2)
+
+        # Method 2: Hold counter (if held for 1+ cycles)
+        hold_detected = (self.button_hold_count.get('L2', 0) >= 1 or
+                         self.button_hold_count.get('R2', 0) >= 1)
+
+        # Method 3: Buffer (catches brief presses from previous cycles)
         buffered = self.button_buffer.get('L2', False) or self.button_buffer.get('R2', False)
-        return live_pressed or buffered
+
+        return live_pressed or hold_detected or buffered
 
     def _check_y_pressed(self):
         """Check if Y button was pressed and consume it."""
@@ -469,7 +503,10 @@ class Go2VisionController:
         if not self.running or self.low_state is None:
             return
 
-        # Check for emergency stop (L2/R2) - highest priority
+        # Update button buffer FIRST - must happen before any button checks
+        self._update_button_buffer()
+
+        # Check for emergency stop (L2/R2) - highest priority, INSTANT response
         if self._check_emergency_stop():
             self._emergency_motor_shutdown()
             return
@@ -480,9 +517,6 @@ class Go2VisionController:
             self.first_run = False
             print(f"\n✓ Captured start position")
             self._print_controls()
-
-        # Update button buffer FIRST (captures rising edges and latches them)
-        self._update_button_buffer()
 
         # Handle button inputs based on current phase (consumes from buffer)
         self._handle_button_inputs()
