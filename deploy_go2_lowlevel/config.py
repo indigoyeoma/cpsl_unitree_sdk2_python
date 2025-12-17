@@ -146,9 +146,9 @@ FIXED_VEL_Y = 0.0          # Lateral velocity [m/s]
 FIXED_VEL_YAW = 0.0        # Yaw rate [rad/s]
 
 # =============================================================================
-# Standing Sequence Timing
+# Standing Sequence Timing (matches Unitree example: 500 ticks @ 500Hz = 1.0s)
 # =============================================================================
-STAND_UP_DURATION = 1.5    # seconds to interpolate to stand
+STAND_UP_DURATION = 1.0    # seconds to interpolate to stand
 SIT_DOWN_DURATION = 1.0    # seconds to interpolate to sit
 
 # =============================================================================
