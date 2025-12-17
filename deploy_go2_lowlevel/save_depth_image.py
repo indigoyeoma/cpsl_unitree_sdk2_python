@@ -34,14 +34,15 @@ from config import (
 
 
 def capture_raw_frame():
-    """Capture a raw depth frame from the RealSense camera."""
+    """Capture depth and RGB frames from the RealSense camera."""
     if not HAS_REALSENSE:
         print("RealSense not available!")
-        return None, None
+        return None, None, None
 
     pipeline = rs.pipeline()
     config = rs.config()
     config.enable_stream(rs.stream.depth, DEPTH_WIDTH, DEPTH_HEIGHT, rs.format.z16, DEPTH_FPS)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, DEPTH_FPS)
 
     try:
         pipeline.start(config)
@@ -54,13 +55,21 @@ def capture_raw_frame():
         # Capture frame
         frames = pipeline.wait_for_frames()
         depth_frame = frames.get_depth_frame()
+        color_frame = frames.get_color_frame()
 
         if not depth_frame:
             print("Failed to get depth frame")
-            return None, None
+            return None, None, None
 
-        # Get raw data (in mm)
+        # Get raw depth data (in mm)
         raw_depth = np.asanyarray(depth_frame.get_data())
+
+        # Get RGB image
+        rgb_image = None
+        if color_frame:
+            rgb_image = np.asanyarray(color_frame.get_data())
+        else:
+            print("Warning: No RGB frame available")
 
         # Apply filters for processed version
         hole_filter = rs.hole_filling_filter()
@@ -76,7 +85,7 @@ def capture_raw_frame():
 
         pipeline.stop()
 
-        return raw_depth, filtered_depth
+        return raw_depth, filtered_depth, rgb_image
 
     except Exception as e:
         print(f"Error capturing frame: {e}")
@@ -84,7 +93,7 @@ def capture_raw_frame():
             pipeline.stop()
         except:
             pass
-        return None, None
+        return None, None, None
 
 
 def preprocess_depth(depth_mm):
@@ -119,8 +128,8 @@ def preprocess_depth(depth_mm):
     return normalized
 
 
-def save_images(raw_depth, filtered_depth, output_dir=".", prefix="depth"):
-    """Save depth images in multiple formats."""
+def save_images(raw_depth, filtered_depth, rgb_image, output_dir=".", prefix="depth"):
+    """Save depth and RGB images in multiple formats."""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
     # Create output directory if needed
@@ -128,16 +137,24 @@ def save_images(raw_depth, filtered_depth, output_dir=".", prefix="depth"):
 
     saved_files = []
 
-    # 1. Save raw depth (mm) as numpy
+    # 1. Save RGB image first (most useful for debugging)
+    if rgb_image is not None and HAS_CV2:
+        rgb_path = os.path.join(output_dir, f"{prefix}_RGB_{timestamp}.png")
+        cv2.imwrite(rgb_path, rgb_image)
+        saved_files.append(rgb_path)
+        print(f"Saved RGB image: {rgb_path}")
+        print(f"  Shape: {rgb_image.shape}, dtype: {rgb_image.dtype}")
+
+    # 2. Save raw depth (mm) as numpy
     raw_path = os.path.join(output_dir, f"{prefix}_raw_{timestamp}.npy")
     np.save(raw_path, raw_depth)
     saved_files.append(raw_path)
-    print(f"Saved raw depth: {raw_path}")
+    print(f"\nSaved raw depth: {raw_path}")
     print(f"  Shape: {raw_depth.shape}, dtype: {raw_depth.dtype}")
     print(f"  Min: {raw_depth.min()} mm, Max: {raw_depth.max()} mm")
     print(f"  Mean: {raw_depth.mean():.1f} mm, Nonzero: {np.count_nonzero(raw_depth)}/{raw_depth.size}")
 
-    # 2. Save filtered depth (mm) as numpy
+    # 3. Save filtered depth (mm) as numpy
     filtered_path = os.path.join(output_dir, f"{prefix}_filtered_{timestamp}.npy")
     np.save(filtered_path, filtered_depth)
     saved_files.append(filtered_path)
@@ -145,7 +162,7 @@ def save_images(raw_depth, filtered_depth, output_dir=".", prefix="depth"):
     print(f"  Shape: {filtered_depth.shape}, dtype: {filtered_depth.dtype}")
     print(f"  Min: {filtered_depth.min()} mm, Max: {filtered_depth.max()} mm")
 
-    # 3. Save preprocessed (what policy sees) as numpy
+    # 4. Save preprocessed (what policy sees) as numpy
     processed = preprocess_depth(filtered_depth)
     processed_path = os.path.join(output_dir, f"{prefix}_processed_{timestamp}.npy")
     np.save(processed_path, processed)
@@ -156,28 +173,28 @@ def save_images(raw_depth, filtered_depth, output_dir=".", prefix="depth"):
     print(f"  Mean: {processed.mean():.4f}")
 
     if HAS_CV2:
-        # 4. Save raw as grayscale visualization (scaled to 0-255)
+        # 5. Save raw as grayscale visualization (scaled to 0-255)
         raw_vis = (raw_depth.astype(np.float32) / raw_depth.max() * 255).astype(np.uint8)
         raw_vis_path = os.path.join(output_dir, f"{prefix}_raw_grayscale_{timestamp}.png")
         cv2.imwrite(raw_vis_path, raw_vis)
         saved_files.append(raw_vis_path)
         print(f"\nSaved raw grayscale: {raw_vis_path}")
 
-        # 5. Save raw as COLOR visualization (JET colormap)
+        # 6. Save raw as COLOR visualization (JET colormap)
         raw_color = cv2.applyColorMap(raw_vis, cv2.COLORMAP_JET)
         raw_color_path = os.path.join(output_dir, f"{prefix}_raw_COLOR_{timestamp}.png")
         cv2.imwrite(raw_color_path, raw_color)
         saved_files.append(raw_color_path)
         print(f"Saved raw COLOR: {raw_color_path}")
 
-        # 6. Save processed as grayscale visualization
+        # 7. Save processed as grayscale visualization
         processed_vis = (processed * 255).astype(np.uint8)
         processed_vis_path = os.path.join(output_dir, f"{prefix}_processed_grayscale_{timestamp}.png")
         cv2.imwrite(processed_vis_path, processed_vis)
         saved_files.append(processed_vis_path)
         print(f"Saved processed grayscale: {processed_vis_path}")
 
-        # 7. Save processed as COLOR visualization (JET colormap) - THIS IS WHAT POLICY SEES
+        # 8. Save processed as COLOR visualization (JET colormap) - THIS IS WHAT POLICY SEES
         processed_color = cv2.applyColorMap(processed_vis, cv2.COLORMAP_JET)
         processed_color_path = os.path.join(output_dir, f"{prefix}_processed_COLOR_{timestamp}.png")
         cv2.imwrite(processed_color_path, processed_color)
@@ -209,18 +226,18 @@ def main():
         count = 0
         try:
             while True:
-                raw, filtered = capture_raw_frame()
+                raw, filtered, rgb = capture_raw_frame()
                 if raw is not None:
-                    save_images(raw, filtered, args.output, f"depth_{count:04d}")
+                    save_images(raw, filtered, rgb, args.output, f"depth_{count:04d}")
                     count += 1
                 time.sleep(args.interval)
         except KeyboardInterrupt:
             print(f"\nStopped. Captured {count} frames.")
     else:
         print("Capturing single frame...")
-        raw, filtered = capture_raw_frame()
+        raw, filtered, rgb = capture_raw_frame()
         if raw is not None:
-            files = save_images(raw, filtered, args.output)
+            files = save_images(raw, filtered, rgb, args.output)
             print(f"\n{'=' * 50}")
             print("Done! Files saved:")
             for f in files:
