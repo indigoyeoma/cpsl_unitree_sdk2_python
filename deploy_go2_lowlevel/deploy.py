@@ -16,6 +16,7 @@ Usage:
     python deploy.py                    # Normal mode
     python deploy.py --dryrun           # Test without motor commands (saves logs)
     python deploy.py --no-camera        # Test without depth camera
+    python deploy.py --show-depth       # Show depth buffer GUI window
 
 Dryrun mode saves sensor logs to: deploy_log_YYYYMMDD_HHMMSS.txt
 """
@@ -87,16 +88,18 @@ class Go2Deployment:
     - Process 2: Depth encoder at ~10Hz, writes embedding to shared memory
     """
 
-    def __init__(self, dryrun: bool = False, no_camera: bool = False):
+    def __init__(self, dryrun: bool = False, no_camera: bool = False, show_depth: bool = False):
         """
         Initialize deployment.
 
         Args:
             dryrun: If True, don't send motor commands
             no_camera: If True, use dummy depth frames
+            show_depth: If True, show depth buffer GUI
         """
         self.dryrun = dryrun
         self.no_camera = no_camera
+        self.show_depth = show_depth
 
         # State machine
         self.state = State.IDLE
@@ -182,6 +185,7 @@ class Go2Deployment:
         print("=" * 60)
         print(f"Mode: {'DRYRUN' if self.dryrun else 'LIVE'}")
         print(f"Camera: {'DISABLED' if self.no_camera else 'ENABLED'}")
+        print(f"Depth GUI: {'ENABLED' if self.show_depth else 'DISABLED'}")
         print()
 
         # Initialize command structure
@@ -250,6 +254,7 @@ class Go2Deployment:
                 self.proprio_ready,
                 self.depth_encoder_stop,
                 not self.no_camera,  # use_camera
+                self.show_depth,     # show_gui
             ),
             daemon=True
         )
@@ -881,6 +886,8 @@ def main():
                         help="Don't send motor commands")
     parser.add_argument("--no-camera", action="store_true",
                         help="Disable depth camera (use dummy frames)")
+    parser.add_argument("--show-depth", action="store_true",
+                        help="Show depth buffer GUI window")
     parser.add_argument("--interface", type=str, default=None,
                         help="Network interface (e.g., eth0)")
     args = parser.parse_args()
@@ -891,7 +898,8 @@ def main():
 
     deployment = Go2Deployment(
         dryrun=args.dryrun,
-        no_camera=args.no_camera
+        no_camera=args.no_camera,
+        show_depth=args.show_depth
     )
 
     if not deployment.init():

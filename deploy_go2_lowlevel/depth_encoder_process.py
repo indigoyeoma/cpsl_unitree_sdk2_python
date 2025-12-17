@@ -81,7 +81,8 @@ def depth_encoder_loop(
     embedding_ready: Value,
     proprio_ready: Value,
     should_stop: Value,
-    use_camera: bool = True
+    use_camera: bool = True,
+    show_gui: bool = False
 ):
     """
     Main loop for depth encoder process.
@@ -93,8 +94,20 @@ def depth_encoder_loop(
         proprio_ready: Flag indicating new proprio is available
         should_stop: Flag to stop the process
         use_camera: Whether to use real camera or dummy frames
+        show_gui: Whether to display depth visualization window
     """
     print("[DepthEncoder] Starting depth encoder process...")
+
+    # Import OpenCV if GUI is requested
+    cv2 = None
+    if show_gui:
+        try:
+            import cv2 as cv2_import
+            cv2 = cv2_import
+            print("[DepthEncoder] GUI enabled - will show depth visualization")
+        except ImportError:
+            print("[DepthEncoder] WARNING: OpenCV not available, GUI disabled")
+            show_gui = False
 
     # Use CPU - often faster for small models on Jetson due to less overhead
     device = torch.device("cpu")
@@ -202,12 +215,32 @@ def depth_encoder_loop(
             fps = 1.0 / (t_end - t_start) if (t_end - t_start) > 0 else 0
             print(f"[DepthEncoder] Loop {loop_count}: {(t_end-t_start)*1000:.1f}ms ({fps:.1f} Hz)")
 
+        # Show depth visualization if GUI enabled
+        if show_gui and cv2 is not None:
+            # Convert normalized depth [-0.5, 0.5] to display range [0, 255]
+            display_frame = ((depth_frame + 0.5) * 255).astype(np.uint8)
+            # Apply colormap for better visualization
+            display_color = cv2.applyColorMap(display_frame, cv2.COLORMAP_VIRIDIS)
+            # Resize for better visibility (4x)
+            display_large = cv2.resize(display_color, (DEPTH_OUTPUT_WIDTH * 4, DEPTH_OUTPUT_HEIGHT * 4),
+                                       interpolation=cv2.INTER_NEAREST)
+            # Add text overlay
+            cv2.putText(display_large, f"Depth Buffer (Loop {loop_count})", (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.imshow("Depth Buffer", display_large)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("[DepthEncoder] 'q' pressed, stopping...")
+                should_stop.value = True
+
         # Small sleep to prevent busy-waiting
         time.sleep(0.001)
 
     # Cleanup
     if camera is not None:
         camera.stop()
+    if show_gui and cv2 is not None:
+        cv2.destroyAllWindows()
     print("[DepthEncoder] Process stopped")
 
 
