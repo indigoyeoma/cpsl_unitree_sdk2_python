@@ -294,6 +294,11 @@ class PolicyRunner:
         # Read yaw prediction from shared memory (from depth encoder process)
         yaw_pred = self.get_yaw_pred_from_shared()
 
+        # Debug: print yaw prediction periodically
+        self._inference_count = getattr(self, '_inference_count', 0) + 1
+        if self._inference_count % 50 == 1:
+            print(f"  [YawPred] sin={yaw_pred[0]:.4f}, cos={yaw_pred[1]:.4f}")
+
         # Build proprioceptive observation with yaw prediction
         proprio = self.build_proprio_obs(
             ang_vel, roll, pitch, dof_pos, dof_vel, foot_contacts, cmd_vel_x,
