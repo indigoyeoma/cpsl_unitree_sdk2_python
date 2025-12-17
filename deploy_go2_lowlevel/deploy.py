@@ -1295,9 +1295,7 @@ class Go2VisionController:
         # Use SDK order directly - it matches training observation order!
         dof_pos = joint_pos - self.config.default_joint_angles  # Both in SDK order
 
-        # CLAMP dof_pos to training distribution (prevents feedback loop)
-        # Training rarely sees values beyond ±0.5, values like -0.64 cause extreme outputs
-        dof_pos = np.clip(dof_pos, -0.5, 0.5)
+        # No clipping - training doesn't clip dof_pos, policy handles full range
 
         last_action = self.last_action if len(self.action_history) > 0 else np.zeros(12)
 
