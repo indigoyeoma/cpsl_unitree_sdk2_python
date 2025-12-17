@@ -410,6 +410,13 @@ class Go2Deployment:
 
         # Extra debug info (raw actions, etc.)
         if extra_debug:
+            # Yaw prediction from depth encoder
+            if 'yaw_pred_sin' in extra_debug and 'yaw_pred_cos' in extra_debug:
+                yaw_sin = extra_debug['yaw_pred_sin']
+                yaw_cos = extra_debug['yaw_pred_cos']
+                self.log_file.write(f"\n[Yaw Prediction (from depth encoder)]\n")
+                self.log_file.write(f"  sin={yaw_sin:+.4f}, cos={yaw_cos:+.4f}\n")
+
             if extra_debug.get('last_actions') is not None:
                 actions = extra_debug['last_actions']
                 self.log_file.write(f"\n[Last Actions (SDK order, raw from policy)]\n")
@@ -813,6 +820,10 @@ class Go2Deployment:
             print(f"  [WARNING] tick={self.policy_tick}: Large raw actions! max={action_max:.3f}")
             print(f"    raw_actions={raw_actions}")
 
+        # Get yaw prediction from shared memory for logging
+        yaw_pred_sin = float(self.shared_embedding[32])
+        yaw_pred_cos = float(self.shared_embedding[33])
+
         # Log comprehensive data for debugging (depth is in separate process now)
         extra_debug = {
             'ang_vel': ang_vel.tolist(),
@@ -823,6 +834,8 @@ class Go2Deployment:
             'foot_contacts': foot_contacts.tolist(),
             'last_actions': self.policy.last_actions.tolist() if self.policy else None,
             'raw_actions': raw_actions.tolist(),
+            'yaw_pred_sin': yaw_pred_sin,
+            'yaw_pred_cos': yaw_pred_cos,
         }
         self._log_sensor_data(depth_stats=None, policy_output=targets, extra_debug=extra_debug)
 
