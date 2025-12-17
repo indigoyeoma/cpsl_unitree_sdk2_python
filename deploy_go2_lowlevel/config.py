@@ -120,21 +120,21 @@ DEPTH_WIDTH = 640          # Native capture width
 DEPTH_HEIGHT = 480         # Native capture height
 DEPTH_FPS = 30             # Frame rate
 
-# Cropping (matching training proportions)
-# Training: 106x60 with crop_top=6, crop_left=5, crop_right=6
+# Cropping (matching training go2_student_config.py)
+# Training: 106x60 with crop_top=6, crop_bottom=0, crop_left=5, crop_right=6
 # Deployment: 640x480 scaled proportionally
-CROP_TOP = 48              # 480 * 0.10 = 48
-CROP_BOTTOM = 0
-CROP_LEFT = 28             # 640 * 0.044 = 28
-CROP_RIGHT = 36            # 640 * 0.056 = 36
+CROP_TOP = 48              # 6/60 * 480 = 48
+CROP_BOTTOM = 0            # 0 (matches training)
+CROP_LEFT = 30             # 5/106 * 640 ≈ 30
+CROP_RIGHT = 36            # 6/106 * 640 ≈ 36
 
 # Output resolution (matching training)
 DEPTH_OUTPUT_WIDTH = 87
 DEPTH_OUTPUT_HEIGHT = 58
 
-# Depth range
-DEPTH_NEAR = 0.3           # meters (D435i min)
-DEPTH_FAR = 3.0            # meters
+# Depth range (matching training go2_student_config.py)
+DEPTH_NEAR = 0.3           # meters (near_clip in training)
+DEPTH_FAR = 3.0            # meters (far_clip in training)
 
 # =============================================================================
 # Fixed Velocity Command

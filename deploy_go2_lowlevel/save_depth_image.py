@@ -122,8 +122,9 @@ def preprocess_depth(depth_mm):
         col_indices = (np.arange(target_w) * cropped.shape[1] / target_w).astype(int)
         resized = depth_m[row_indices[:, None], col_indices]
 
-    # Normalize to [0, 1]
-    normalized = (resized - DEPTH_NEAR) / (DEPTH_FAR - DEPTH_NEAR)
+    # Normalize to [-0.5, 0.5] (matching training go2_student_config.py)
+    # Training: (depth - near_clip) / (far_clip - near_clip) - 0.5
+    normalized = (resized - DEPTH_NEAR) / (DEPTH_FAR - DEPTH_NEAR) - 0.5
 
     return normalized
 
@@ -188,7 +189,8 @@ def save_images(raw_depth, filtered_depth, rgb_image, output_dir=".", prefix="de
         print(f"Saved raw COLOR: {raw_color_path}")
 
         # 7. Save processed as grayscale visualization
-        processed_vis = (processed * 255).astype(np.uint8)
+        # Processed is in [-0.5, 0.5], convert to [0, 255] for visualization
+        processed_vis = ((processed + 0.5) * 255).astype(np.uint8)
         processed_vis_path = os.path.join(output_dir, f"{prefix}_processed_grayscale_{timestamp}.png")
         cv2.imwrite(processed_vis_path, processed_vis)
         saved_files.append(processed_vis_path)

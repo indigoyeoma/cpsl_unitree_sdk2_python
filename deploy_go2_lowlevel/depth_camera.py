@@ -189,8 +189,9 @@ class DepthCamera:
         # Resize to policy input size
         resized = self._resize(depth_m, (DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH))
 
-        # Normalize to [0, 1]
-        normalized = (resized - DEPTH_NEAR) / (DEPTH_FAR - DEPTH_NEAR)
+        # Normalize to [-0.5, 0.5] (matching training go2_student_config.py)
+        # Training: (depth - near_clip) / (far_clip - near_clip) - 0.5
+        normalized = (resized - DEPTH_NEAR) / (DEPTH_FAR - DEPTH_NEAR) - 0.5
 
         return normalized.astype(np.float32)
 
