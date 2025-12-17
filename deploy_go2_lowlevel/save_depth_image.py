@@ -173,6 +173,19 @@ def save_images(raw_depth, filtered_depth, rgb_image, output_dir=".", prefix="de
     print(f"  Min: {processed.min():.4f}, Max: {processed.max():.4f}")
     print(f"  Mean: {processed.mean():.4f}")
 
+    # 5. Save processed depth as readable text file
+    processed_txt_path = os.path.join(output_dir, f"{prefix}_processed_{timestamp}.txt")
+    with open(processed_txt_path, 'w') as f:
+        f.write(f"# Processed Depth Image (Policy Input)\n")
+        f.write(f"# Shape: {processed.shape} (H x W)\n")
+        f.write(f"# Range: [-0.5, 0.5] (near=0.3m, far=3.0m)\n")
+        f.write(f"# Min: {processed.min():.4f}, Max: {processed.max():.4f}, Mean: {processed.mean():.4f}\n")
+        f.write(f"#\n")
+        f.write(f"# Values (row by row):\n")
+        np.savetxt(f, processed, fmt='%.4f', delimiter=', ')
+    saved_files.append(processed_txt_path)
+    print(f"Saved processed depth as text: {processed_txt_path}")
+
     if HAS_CV2:
         # 5. Save raw as grayscale visualization (scaled to 0-255)
         raw_vis = (raw_depth.astype(np.float32) / raw_depth.max() * 255).astype(np.uint8)
