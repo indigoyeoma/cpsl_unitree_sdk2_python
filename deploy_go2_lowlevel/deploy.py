@@ -677,8 +677,8 @@ class Go2Deployment:
                 self._enter_state(State.STANDING)
 
         elif self.state == State.STANDING:
-            # Hold at stand position (with torque limiting for safety)
-            self._send_motor_commands(DEFAULT_STAND_ANGLES_SDK, KP_STAND, KD_STAND)
+            # Hold at stand position (skip torque limiting - static hold doesn't need it)
+            self._send_motor_commands(DEFAULT_STAND_ANGLES_SDK, KP_STAND, KD_STAND, skip_torque_limit=True)
 
             # L1 to start walking (like parkour)
             if buttons & self.WirelessButtons.L1:
