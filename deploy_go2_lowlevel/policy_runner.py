@@ -1,139 +1,75 @@
 """
 Policy runner for Go2 vision-based locomotion.
 
-Loads the JIT-traced policy and depth encoder, provides inference methods.
+Two-process architecture:
+- This module runs the BASE POLICY only (fast, ~10ms)
+- Depth encoder runs in separate process (depth_encoder_process.py)
+- Communication via shared memory buffers
 """
 import os
 import torch
 import torch.nn as nn
 import numpy as np
 from typing import Tuple, Optional
+from multiprocessing import Array, Value
+from ctypes import c_float, c_bool
 
 from config import (
-    BASE_JIT_PATH, VISION_WEIGHT_PATH,
+    BASE_JIT_PATH,
     N_PROPRIO, N_SCAN, N_PRIV_EXPLICIT, N_PRIV_LATENT, HISTORY_LEN, N_OBS,
-    DEPTH_LATENT_DIM, DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH,
+    DEPTH_LATENT_DIM,
     DEFAULT_STAND_ANGLES_SDK, ACTION_SCALE, CLIP_ACTIONS,
     ObsScales
 )
-
-
-class DepthOnlyFCBackbone58x87(nn.Module):
-    """
-    CNN backbone for 58x87 depth images.
-    Matches training architecture exactly.
-    """
-
-    def __init__(self, num_frames: int = 1):
-        super().__init__()
-        self.num_frames = num_frames
-        activation = nn.ELU()
-
-        self.image_compression = nn.Sequential(
-            # Input: [1, 58, 87]
-            nn.Conv2d(in_channels=num_frames, out_channels=32, kernel_size=5),
-            # Output: [32, 54, 83]
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            # Output: [32, 27, 41]
-            activation,
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3),
-            # Output: [64, 25, 39]
-            activation,
-            nn.Flatten(),
-            # Output: [64 * 25 * 39] = [62400]
-            nn.Linear(64 * 25 * 39, 128),
-            activation,
-            nn.Linear(128, 32)
-        )
-        self.output_activation = activation
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            images: Depth images [batch, H, W] or [batch, 1, H, W]
-
-        Returns:
-            Latent representation [batch, 32]
-        """
-        if images.dim() == 3:
-            images = images.unsqueeze(1)  # Add channel dimension
-        compressed = self.image_compression(images)
-        return self.output_activation(compressed)
-
-
-class SimpleDepthEncoder(nn.Module):
-    """
-    Feedforward depth encoder (no GRU).
-    Combines depth backbone output with proprioception.
-    """
-
-    def __init__(self, n_proprio: int = N_PROPRIO):
-        super().__init__()
-        activation = nn.ELU()
-        last_activation = nn.Tanh()
-
-        self.base_backbone = DepthOnlyFCBackbone58x87(num_frames=1)
-
-        # Combine depth latent with proprioception
-        self.combination_mlp = nn.Sequential(
-            nn.Linear(32 + n_proprio, 128),
-            activation,
-            nn.Linear(128, 32)
-        )
-
-        # Output: 32 depth latent + 2 yaw prediction
-        self.output_mlp = nn.Sequential(
-            nn.Linear(32, 32 + 2),
-            last_activation
-        )
-
-    def forward(self, depth_image: torch.Tensor, proprioception: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            depth_image: Depth frame [batch, H, W]
-            proprioception: Proprio state [batch, n_proprio]
-
-        Returns:
-            Depth latent + yaw prediction [batch, 34]
-        """
-        depth_latent = self.base_backbone(depth_image)
-        combined = torch.cat([depth_latent, proprioception], dim=-1)
-        latent = self.combination_mlp(combined)
-        output = self.output_mlp(latent)
-        return output
 
 
 class PolicyRunner:
     """
     Runs the vision-based locomotion policy.
 
-    Handles:
-    - Loading JIT-traced base policy
-    - Loading depth encoder weights
-    - Joint reordering between SDK and training conventions
-    - Building observations from robot state
+    Two-process architecture:
+    - Depth encoder runs in separate process, writes to shared_embedding
+    - This class reads embedding from shared memory, runs base policy
+    - Writes proprio to shared memory for depth encoder
     """
 
-    def __init__(self, device: str = "cuda"):
+    def __init__(
+        self,
+        shared_embedding: Array,
+        shared_proprio: Array,
+        device: str = "cuda"
+    ):
         """
         Initialize the policy runner.
 
         Args:
+            shared_embedding: Shared array for 32-dim depth embedding (read from depth encoder)
+            shared_proprio: Shared array for N_PROPRIO proprio (write for depth encoder)
             device: Torch device ("cuda" or "cpu")
         """
+        self.shared_embedding = shared_embedding
+        self.shared_proprio = shared_proprio
+
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         print(f"PolicyRunner using device: {self.device}")
 
+        # Enable cudnn optimizations
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.enabled = True
+
         self.base_policy = None
-        self.depth_encoder = None
 
         # History buffer for observations
         self.obs_history = None
         self.last_actions = np.zeros(12, dtype=np.float32)
 
+        # Cache for depth latent
+        self._cached_depth_latent = np.zeros(DEPTH_LATENT_DIM, dtype=np.float32)
+
     def load_models(self) -> bool:
         """
-        Load the policy and depth encoder models.
+        Load the base policy model.
 
         Returns:
             True if loaded successfully, False otherwise
@@ -145,51 +81,30 @@ class PolicyRunner:
             self.base_policy.eval()
             print("Base policy loaded successfully")
 
-            # Load depth encoder weights
-            print(f"Loading depth encoder from: {VISION_WEIGHT_PATH}")
-            state_dict = torch.load(VISION_WEIGHT_PATH, map_location=self.device)
-
-            self.depth_encoder = SimpleDepthEncoder(n_proprio=N_PROPRIO)
-            self.depth_encoder.load_state_dict(state_dict['depth_encoder_state_dict'])
-            self.depth_encoder.to(self.device)
-            self.depth_encoder.eval()
-            print("Depth encoder loaded successfully")
-
             # Initialize history buffer
             self.reset()
 
-            # GPU warmup - first inference is slow due to CUDA memory allocation
-            print("Running GPU warmup...")
+            # GPU warmup for base policy
+            print("Running GPU warmup for base policy...")
             print(f"  Device: {self.device}")
             print(f"  CUDA available: {torch.cuda.is_available()}")
             if torch.cuda.is_available():
                 print(f"  CUDA device: {torch.cuda.get_device_name(0)}")
-                print(f"  CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-            dummy_depth = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
-            dummy_ang_vel = np.zeros(3, dtype=np.float32)
-            dummy_dof_pos = DEFAULT_STAND_ANGLES_SDK.copy()
-            dummy_dof_vel = np.zeros(12, dtype=np.float32)
-            dummy_contacts = np.ones(4, dtype=np.float32)
+            dummy_obs = torch.zeros(1, N_OBS, dtype=torch.float32, device=self.device)
+            dummy_latent = torch.zeros(1, DEPTH_LATENT_DIM, dtype=torch.float32, device=self.device)
 
             import time
             for i in range(5):
                 t0 = time.time()
-                # Time each component
-                proprio = self.build_proprio_obs(dummy_ang_vel, 0.0, 0.0, dummy_dof_pos, dummy_dof_vel, dummy_contacts, 0.5)
+                with torch.no_grad():
+                    _ = self.base_policy(dummy_obs, dummy_latent)
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
                 t1 = time.time()
-                obs = self.build_full_obs(proprio)
-                t2 = time.time()
-                depth_latent = self.get_depth_latent(dummy_depth, proprio)
-                t3 = time.time()
-                targets, _ = self.get_action(obs, depth_latent)
-                t4 = time.time()
+                print(f"  Warmup {i+1}/5: {(t1-t0)*1000:.1f}ms")
 
-                print(f"  Warmup {i+1}/5: total={((t4-t0)*1000):.1f}ms | "
-                      f"proprio={((t1-t0)*1000):.1f}ms, obs={((t2-t1)*1000):.1f}ms, "
-                      f"depth_enc={((t3-t2)*1000):.1f}ms, policy={((t4-t3)*1000):.1f}ms")
-
-            self.reset()  # Reset history after warmup
+            self.reset()
             print("GPU warmup complete")
 
             return True
@@ -205,6 +120,17 @@ class PolicyRunner:
         self.obs_history = None
         self.last_actions = np.zeros(12, dtype=np.float32)
 
+    def get_depth_latent_from_shared(self) -> np.ndarray:
+        """Read depth latent from shared memory (written by depth encoder process)."""
+        for i in range(DEPTH_LATENT_DIM):
+            self._cached_depth_latent[i] = self.shared_embedding[i]
+        return self._cached_depth_latent.copy()
+
+    def write_proprio_to_shared(self, proprio: np.ndarray):
+        """Write proprio to shared memory for depth encoder process."""
+        for i in range(min(len(proprio), N_PROPRIO)):
+            self.shared_proprio[i] = proprio[i]
+
     def build_proprio_obs(
         self,
         ang_vel: np.ndarray,       # [3] gyroscope in rad/s
@@ -218,31 +144,17 @@ class PolicyRunner:
         """
         Build the proprioceptive observation vector.
 
-        Training applies reindex() to convert SIM order → SDK order for observations.
-        Real robot sensors already give SDK order, so NO reindexing needed!
-
         Returns:
-            Proprio observation [N_PROPRIO] in SDK order (matches training after reindex)
+            Proprio observation [N_PROPRIO] in SDK order
         """
-        # NO REINDEXING NEEDED!
-        # Training: reindex(dof_pos) converts SIM→SDK for observations
-        # Deployment: sensors already give SDK order, use directly
-
-        # Apply observation scales (all in SDK order)
+        # Apply observation scales
         ang_vel_scaled = ang_vel * ObsScales.ang_vel
         dof_pos_normalized = (dof_pos - DEFAULT_STAND_ANGLES_SDK) * ObsScales.dof_pos
         dof_vel_scaled = dof_vel * ObsScales.dof_vel
+        last_actions_sdk = self.last_actions
+        contacts_sdk = foot_contacts
 
-        # last_actions from policy is SDK order (policy trained on SDK-order obs)
-        # Training: reindex(action_history_buf) also gives SDK order in observations
-        last_actions_sdk = self.last_actions  # SDK order from policy output
-
-        # Foot contacts: SDK order [FR, FL, RR, RL]
-        # Training: reindex_feet(contacts) converts SIM feet→SDK feet order
-        # Real sensors already give SDK order
-        contacts_sdk = foot_contacts  # Already SDK order
-
-        # Build observation vector (all in SDK order, matching training after reindex)
+        # Build observation vector
         proprio = np.concatenate([
             ang_vel_scaled,                      # [3] base angular velocity
             np.array([roll, pitch]),             # [2] orientation
@@ -271,17 +183,16 @@ class PolicyRunner:
         Returns:
             Full observation [N_OBS]
         """
-        # Initialize history if needed (fill with current proprio, matching training reset)
+        # Initialize history if needed
         if self.obs_history is None:
             proprio_masked = proprio.copy()
-            proprio_masked[6:8] = 0.0  # Mask yaw
+            proprio_masked[6:8] = 0.0
             self.obs_history = np.tile(proprio_masked, (HISTORY_LEN, 1))
 
-        # Build full observation FIRST (using history from previous steps)
-        # This matches training: obs is built, THEN history is updated
-        scan = np.zeros(N_SCAN, dtype=np.float32)  # Placeholder (replaced by depth latent)
-        priv_explicit = np.zeros(N_PRIV_EXPLICIT, dtype=np.float32)  # Estimated by network
-        priv_latent = np.zeros(N_PRIV_LATENT, dtype=np.float32)  # Placeholder
+        # Build full observation using history from previous steps
+        scan = np.zeros(N_SCAN, dtype=np.float32)
+        priv_explicit = np.zeros(N_PRIV_EXPLICIT, dtype=np.float32)
+        priv_latent = np.zeros(N_PRIV_LATENT, dtype=np.float32)
 
         obs = np.concatenate([
             proprio,                           # [53] current proprio
@@ -291,8 +202,7 @@ class PolicyRunner:
             self.obs_history.flatten(),        # [530] history from PREVIOUS steps
         ]).astype(np.float32)
 
-        # THEN update history buffer (FIFO) for next step
-        # Mask yaw in history (indices 6:8) - matching training
+        # Update history buffer (FIFO) for next step
         proprio_for_history = proprio.copy()
         proprio_for_history[6:8] = 0.0
 
@@ -300,32 +210,6 @@ class PolicyRunner:
         self.obs_history[-1] = proprio_for_history
 
         return obs
-
-    @torch.no_grad()
-    def get_depth_latent(
-        self,
-        depth_image: np.ndarray,
-        proprio: np.ndarray
-    ) -> np.ndarray:
-        """
-        Get depth latent from the depth encoder.
-
-        Args:
-            depth_image: Preprocessed depth frame [H, W]
-            proprio: Proprioceptive observation [N_PROPRIO]
-
-        Returns:
-            Depth latent [32]
-        """
-        # Convert to tensors
-        depth_tensor = torch.from_numpy(depth_image).float().unsqueeze(0).to(self.device)
-        proprio_tensor = torch.from_numpy(proprio).float().unsqueeze(0).to(self.device)
-
-        # Run depth encoder
-        output = self.depth_encoder(depth_tensor, proprio_tensor)
-
-        # Return only the depth latent (first 32 dims), not yaw prediction
-        return output[0, :32].cpu().numpy()
 
     @torch.no_grad()
     def get_action(
@@ -351,28 +235,20 @@ class PolicyRunner:
         actions_raw = self.base_policy(obs_tensor, depth_tensor)
         actions_raw = actions_raw[0].cpu().numpy()
 
-        # Store RAW actions for next step (used in observations)
-        # Training stores raw actions in action_history_buf BEFORE clipping
+        # Store RAW actions for next step
         self.last_actions = actions_raw.copy()
 
         # Clip actions before scaling
-        # Training: clip_actions = 1.2 / action_scale = 1.2 / 0.25 = 4.8
         effective_clip = CLIP_ACTIONS / ACTION_SCALE  # = 4.8
         actions_clipped = np.clip(actions_raw, -effective_clip, effective_clip)
 
-        # Policy outputs actions in SDK order (trained on SDK-order observations)
-        # Training: reindex(policy_output) converts SDK→SIM for physics
-        # Deployment: motors expect SDK order, so NO reindexing needed!
-        actions_sdk = actions_clipped  # Already SDK order from policy
-
-        # Convert to joint targets: action * scale + default_pos (both in SDK order)
-        targets_sdk = actions_sdk * ACTION_SCALE + DEFAULT_STAND_ANGLES_SDK
+        # Convert to joint targets
+        targets_sdk = actions_clipped * ACTION_SCALE + DEFAULT_STAND_ANGLES_SDK
 
         return targets_sdk, actions_raw
 
     def run_inference(
         self,
-        depth_image: np.ndarray,
         ang_vel: np.ndarray,
         roll: float,
         pitch: float,
@@ -384,8 +260,10 @@ class PolicyRunner:
         """
         Run full inference pipeline.
 
+        Reads depth embedding from shared memory (from depth encoder process).
+        Writes proprio to shared memory for depth encoder.
+
         Args:
-            depth_image: Preprocessed depth frame [H, W]
             ang_vel: Angular velocity from IMU [3]
             roll, pitch: Orientation angles
             dof_pos, dof_vel: Joint states in SDK order [12]
@@ -400,50 +278,16 @@ class PolicyRunner:
             ang_vel, roll, pitch, dof_pos, dof_vel, foot_contacts, cmd_vel_x
         )
 
+        # Write proprio to shared memory for depth encoder process
+        self.write_proprio_to_shared(proprio)
+
         # Build full observation
         obs = self.build_full_obs(proprio)
 
-        # Get depth latent
-        depth_latent = self.get_depth_latent(depth_image, proprio)
+        # Read depth latent from shared memory (from depth encoder process)
+        depth_latent = self.get_depth_latent_from_shared()
 
-        # Get action (returns tuple of targets and raw actions)
+        # Get action
         targets, raw_actions = self.get_action(obs, depth_latent)
 
         return targets, raw_actions
-
-
-def test_policy():
-    """Test the policy runner with dummy inputs."""
-    print("Testing policy runner...")
-
-    runner = PolicyRunner(device="cuda")
-
-    if not runner.load_models():
-        print("Failed to load models")
-        return
-
-    print("\nRunning inference with dummy inputs...")
-    print(f"Action clipping enabled: raw actions clipped to [-{CLIP_ACTIONS}, {CLIP_ACTIONS}]")
-
-    # Create dummy inputs
-    depth_image = np.random.rand(DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH).astype(np.float32)
-    ang_vel = np.zeros(3, dtype=np.float32)
-    roll, pitch = 0.0, 0.0
-    dof_pos = np.array([-0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 1.0, -1.5, 0.1, 1.0, -1.5], dtype=np.float32)
-    dof_vel = np.zeros(12, dtype=np.float32)
-    foot_contacts = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
-
-    # Run inference
-    for i in range(5):
-        targets, raw_actions = runner.run_inference(
-            depth_image, ang_vel, roll, pitch, dof_pos, dof_vel, foot_contacts
-        )
-        print(f"Step {i+1}:")
-        print(f"  Raw actions: min={raw_actions.min():.3f}, max={raw_actions.max():.3f}")
-        print(f"  Targets: {targets}")
-
-    print("\nTest complete")
-
-
-if __name__ == "__main__":
-    test_policy()

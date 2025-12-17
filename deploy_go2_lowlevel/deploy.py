@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Go2 Vision Policy Deployment Script
+Go2 Vision Policy Deployment Script (Two-Process Architecture)
+
+Architecture:
+    Process 1 (this): Policy loop at 50Hz, motor control at 500Hz
+    Process 2 (spawned): Depth encoder at ~10Hz, writes embedding to shared memory
 
 Controls:
     Y:  Stand up (from IDLE) - 2-phase interpolation like Unitree example
@@ -18,12 +22,13 @@ Dryrun mode saves sensor logs to: deploy_log_YYYYMMDD_HHMMSS.txt
 import sys
 import os
 import time
-import struct
 import argparse
 import numpy as np
 from enum import IntEnum
 from typing import Optional
 from datetime import datetime
+from multiprocessing import Process, Array, Value
+from ctypes import c_float, c_bool
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,16 +44,14 @@ from unitree_sdk2py.go2.sport.sport_client import SportClient
 from config import (
     MOTOR_DT, POLICY_DECIMATION,
     KP_WALK, KD_WALK, KP_STAND, KD_STAND,
-    ACTION_SCALE,
+    ACTION_SCALE, N_PROPRIO, DEPTH_LATENT_DIM,
     DEFAULT_STAND_ANGLES_SDK, JOINT_POS_MIN, JOINT_POS_MAX,
-    STAND_UP_DURATION, SIT_DOWN_DURATION,
     FIXED_VEL_X, SDK_TO_TRAIN_JOINTS,
-    DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH,
     DEPTH_NEAR, DEPTH_FAR,
     TORQUE_LIMITS
 )
-from depth_camera import DepthCamera
 from policy_runner import PolicyRunner
+from depth_encoder_process import depth_encoder_loop
 
 # Motor control constants
 PosStopF = 2.146e9
@@ -78,6 +81,10 @@ SIT_ANGLES_SDK = np.array([
 class Go2Deployment:
     """
     Main deployment class for Go2 vision policy.
+
+    Uses two-process architecture:
+    - Process 1 (this): Policy loop at 50Hz, motor control at 500Hz
+    - Process 2: Depth encoder at ~10Hz, writes embedding to shared memory
     """
 
     def __init__(self, dryrun: bool = False, no_camera: bool = False):
@@ -119,8 +126,17 @@ class Go2Deployment:
         # Button state for edge detection (print only on press)
         self._last_buttons = 0
 
+        # Shared memory for two-process architecture
+        self.shared_embedding = Array(c_float, DEPTH_LATENT_DIM)  # Depth latent from encoder
+        self.shared_proprio = Array(c_float, N_PROPRIO)  # Proprio for encoder
+        self.embedding_ready = Value(c_bool, False)
+        self.proprio_ready = Value(c_bool, False)
+        self.depth_encoder_stop = Value(c_bool, False)
+
+        # Depth encoder process
+        self.depth_encoder_process: Optional[Process] = None
+
         # Components
-        self.camera: Optional[DepthCamera] = None
         self.policy: Optional[PolicyRunner] = None
 
         # Publishers/subscribers
@@ -222,20 +238,33 @@ class Go2Deployment:
         if not self._verify_joint_mapping():
             return False
 
-        # Initialize depth camera
-        if not self.no_camera:
-            print("Initializing depth camera...")
-            self.camera = DepthCamera(enable_filters=True)
-            if not self.camera.start():
-                print("ERROR: Failed to start depth camera")
-                return False
-        else:
-            print("Camera disabled - using dummy frames")
-            self.camera = DepthCamera(enable_filters=False)
+        # Start depth encoder in separate process
+        print("Starting depth encoder process...")
+        self.depth_encoder_process = Process(
+            target=depth_encoder_loop,
+            args=(
+                self.shared_embedding,
+                self.shared_proprio,
+                self.embedding_ready,
+                self.proprio_ready,
+                self.depth_encoder_stop,
+                not self.no_camera,  # use_camera
+            ),
+            daemon=True
+        )
+        self.depth_encoder_process.start()
+        print(f"Depth encoder process started (PID: {self.depth_encoder_process.pid})")
 
-        # Initialize policy
-        print("Loading policy...")
-        self.policy = PolicyRunner(device="cuda")
+        # Wait a bit for depth encoder to initialize
+        time.sleep(2.0)
+
+        # Initialize policy (reads embedding from shared memory)
+        print("Loading base policy...")
+        self.policy = PolicyRunner(
+            shared_embedding=self.shared_embedding,
+            shared_proprio=self.shared_proprio,
+            device="cuda"
+        )
         if not self.policy.load_models():
             print("ERROR: Failed to load policy models")
             return False
@@ -691,16 +720,8 @@ class Go2Deployment:
             # Run policy at 50Hz
             if self.tick % POLICY_DECIMATION == 0:
                 self.policy_tick += 1
-                policy_result = self._run_policy()
-
-                # Check if policy failed (depth is None)
-                if policy_result is None:
-                    print("  Depth camera failed - stopping policy and sitting down")
-                    self.policy.reset()
-                    self._enter_state(State.SITTING_DOWN)
-                    return
-
-                self.current_target = policy_result
+                # Depth embedding is read from shared memory (from depth encoder process)
+                self.current_target = self._run_policy()
 
             # Keep torque limiting during walking for safety
             self._send_motor_commands(self.current_target, KP_WALK, KD_WALK)
@@ -738,22 +759,12 @@ class Go2Deployment:
         """
         Run one step of the vision policy.
 
+        Depth embedding is read from shared memory (from depth encoder process).
+
         Returns:
-            Joint position targets in SDK order [12], or None if depth camera fails
+            Joint position targets in SDK order [12]
         """
         t_start = time.time()
-
-        # Get depth frame (from buffer - should be instant)
-        if self.camera is not None and not self.no_camera:
-            depth = self.camera.get_frame()
-            if depth is None:
-                print("WARNING: Depth frame is None - cancelling policy!")
-                return None  # Signal to stop policy
-        elif self.no_camera:
-            # No camera mode - use dummy depth
-            depth = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
-        else:
-            depth = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
 
         # Get robot state
         state = self.low_state
@@ -776,9 +787,8 @@ class Go2Deployment:
 
         t_before_inference = time.time()
 
-        # Run inference (returns targets and raw_actions for logging)
+        # Run inference (depth embedding read from shared memory inside run_inference)
         targets, raw_actions = self.policy.run_inference(
-            depth_image=depth,
             ang_vel=ang_vel,
             roll=roll,
             pitch=pitch,
@@ -802,12 +812,7 @@ class Go2Deployment:
             print(f"  [WARNING] tick={self.policy_tick}: Large raw actions! max={action_max:.3f}")
             print(f"    raw_actions={raw_actions}")
 
-        # Log comprehensive data for debugging
-        depth_stats = {
-            'min': float(depth.min()),
-            'max': float(depth.max()),
-            'mean': float(depth.mean())
-        }
+        # Log comprehensive data for debugging (depth is in separate process now)
         extra_debug = {
             'ang_vel': ang_vel.tolist(),
             'roll': float(roll),
@@ -816,9 +821,9 @@ class Go2Deployment:
             'dof_vel_sdk': dof_vel.tolist(),
             'foot_contacts': foot_contacts.tolist(),
             'last_actions': self.policy.last_actions.tolist() if self.policy else None,
-            'raw_actions': raw_actions.tolist(),  # Raw unclipped actions for debugging
+            'raw_actions': raw_actions.tolist(),
         }
-        self._log_sensor_data(depth_stats=depth_stats, policy_output=targets, extra_debug=extra_debug)
+        self._log_sensor_data(depth_stats=None, policy_output=targets, extra_debug=extra_debug)
 
         return targets
 
@@ -841,8 +846,14 @@ class Go2Deployment:
         if self.control_thread is not None:
             self.control_thread.Stop()
 
-        if self.camera is not None:
-            self.camera.stop()
+        # Stop depth encoder process
+        if self.depth_encoder_process is not None:
+            print("Stopping depth encoder process...")
+            self.depth_encoder_stop.value = True
+            self.depth_encoder_process.join(timeout=2.0)
+            if self.depth_encoder_process.is_alive():
+                self.depth_encoder_process.terminate()
+            print("Depth encoder process stopped")
 
         # Close log file
         self._close_logging()
