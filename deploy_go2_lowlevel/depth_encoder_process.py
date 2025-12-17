@@ -161,21 +161,35 @@ def depth_encoder_loop(
         for i in range(32):
             shared_embedding[i] = embedding[i]
 
-        # Also write yaw prediction (last 2 dims of output, scaled by 1.5 like parkour)
-        # NOTE: Set to 0 for flat ground testing (no visual target to navigate toward)
-        # For terrain with obstacles, enable the encoder output
-        USE_YAW_PREDICTION = False  # Set True when testing with obstacles/terrain
+        # =====================================================================
+        # Yaw Prediction Options
+        # =====================================================================
+        # Option A: Use depth encoder prediction (for terrain with visual features)
+        # Option B: Use fixed goal direction (for flat ground testing)
+        # =====================================================================
 
-        # Constant yaw correction to counteract rightward drift (positive = turn left)
-        YAW_DRIFT_CORRECTION = 0.15  # Tune this: increase if still drifting right
+        USE_DEPTH_ENCODER_YAW = False  # Set True for terrain with obstacles
 
-        if USE_YAW_PREDICTION:
+        # Fixed goal direction (used when USE_DEPTH_ENCODER_YAW = False)
+        # GOAL_X: meters ahead (always positive)
+        # GOAL_Y: meters to the side (positive = left, negative = right)
+        GOAL_X = 10.0   # 10 meters ahead
+        GOAL_Y = 0.0    # 0 = straight, +2 = 2m left, -2 = 2m right
+
+        # Hardware drift correction (add to delta_yaw to counteract drift)
+        DRIFT_CORRECTION = 0.15  # positive = turn left, tune if needed
+
+        import math
+
+        if USE_DEPTH_ENCODER_YAW:
+            # Use depth encoder's yaw prediction (for navigating terrain)
             yaw_pred = output[0, 32:34].numpy() * 1.5
             shared_embedding[32] = -yaw_pred[0]  # delta_yaw_sin (negated)
             shared_embedding[33] = yaw_pred[1]   # delta_yaw_cos
         else:
-            # Small constant correction to counteract hardware/policy drift
-            shared_embedding[32] = YAW_DRIFT_CORRECTION  # positive = turn left
+            # Use fixed goal direction
+            delta_yaw = math.atan2(GOAL_Y, GOAL_X) + DRIFT_CORRECTION
+            shared_embedding[32] = delta_yaw  # delta_yaw in radians
             shared_embedding[33] = 0.0
 
         embedding_ready.value = True
