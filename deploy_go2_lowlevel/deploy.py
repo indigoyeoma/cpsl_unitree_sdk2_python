@@ -127,7 +127,8 @@ class Go2Deployment:
         self._last_buttons = 0
 
         # Shared memory for two-process architecture
-        self.shared_embedding = Array(c_float, DEPTH_LATENT_DIM)  # Depth latent from encoder
+        # 32 depth latent + 2 yaw prediction = 34 total
+        self.shared_embedding = Array(c_float, DEPTH_LATENT_DIM + 2)  # Depth latent + yaw from encoder
         self.shared_proprio = Array(c_float, N_PROPRIO)  # Proprio for encoder
         self.embedding_ready = Value(c_bool, False)
         self.proprio_ready = Value(c_bool, False)

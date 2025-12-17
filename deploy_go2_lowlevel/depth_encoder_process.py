@@ -157,9 +157,15 @@ def depth_encoder_loop(
             output = depth_encoder(depth_tensor, proprio_tensor)
             embedding = output[0, :32].numpy()  # First 32 dims (not yaw prediction)
 
-        # Write to shared memory
+        # Write to shared memory (32 depth latent + 2 yaw prediction = 34 total)
         for i in range(32):
             shared_embedding[i] = embedding[i]
+
+        # Also write yaw prediction (last 2 dims of output, scaled by 1.5 like parkour)
+        yaw_pred = output[0, 32:34].numpy() * 1.5
+        shared_embedding[32] = yaw_pred[0]  # delta_yaw_sin
+        shared_embedding[33] = yaw_pred[1]  # delta_yaw_cos
+
         embedding_ready.value = True
 
         t_end = time.time()
@@ -183,7 +189,8 @@ if __name__ == "__main__":
     # Test the depth encoder standalone
     from multiprocessing import Array, Value
 
-    shared_embedding = Array(c_float, 32)
+    # 32 depth latent + 2 yaw prediction = 34 total
+    shared_embedding = Array(c_float, 34)
     shared_proprio = Array(c_float, N_PROPRIO)
     embedding_ready = Value(c_bool, False)
     proprio_ready = Value(c_bool, False)

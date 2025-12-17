@@ -67,6 +67,9 @@ class PolicyRunner:
         # Cache for depth latent
         self._cached_depth_latent = np.zeros(DEPTH_LATENT_DIM, dtype=np.float32)
 
+        # Cache for yaw prediction from depth encoder (sin, cos)
+        self._cached_yaw_pred = np.zeros(2, dtype=np.float32)
+
     def load_models(self) -> bool:
         """
         Load the base policy model.
@@ -126,6 +129,12 @@ class PolicyRunner:
             self._cached_depth_latent[i] = self.shared_embedding[i]
         return self._cached_depth_latent.copy()
 
+    def get_yaw_pred_from_shared(self) -> np.ndarray:
+        """Read yaw prediction from shared memory (indices 32-33, written by depth encoder)."""
+        self._cached_yaw_pred[0] = self.shared_embedding[32]  # delta_yaw_sin
+        self._cached_yaw_pred[1] = self.shared_embedding[33]  # delta_yaw_cos
+        return self._cached_yaw_pred.copy()
+
     def write_proprio_to_shared(self, proprio: np.ndarray):
         """Write proprio to shared memory for depth encoder process."""
         for i in range(min(len(proprio), N_PROPRIO)):
@@ -140,9 +149,14 @@ class PolicyRunner:
         dof_vel: np.ndarray,       # [12] joint velocities in SDK order
         foot_contacts: np.ndarray, # [4] contact states in SDK order [FR, FL, RR, RL]
         cmd_vel_x: float = 0.5,    # forward velocity command
+        yaw_pred: Optional[np.ndarray] = None,  # [2] yaw prediction from depth encoder
     ) -> np.ndarray:
         """
         Build the proprioceptive observation vector.
+
+        Args:
+            yaw_pred: Yaw prediction from depth encoder [delta_yaw_sin, delta_yaw_cos]
+                      If None, uses zeros.
 
         Returns:
             Proprio observation [N_PROPRIO] in SDK order
@@ -154,13 +168,17 @@ class PolicyRunner:
         last_actions_sdk = self.last_actions
         contacts_sdk = foot_contacts
 
+        # Use yaw prediction from depth encoder if available
+        delta_yaw_sin = yaw_pred[0] if yaw_pred is not None else 0.0
+        delta_yaw_cos = yaw_pred[1] if yaw_pred is not None else 0.0
+
         # Build observation vector
         proprio = np.concatenate([
             ang_vel_scaled,                      # [3] base angular velocity
             np.array([roll, pitch]),             # [2] orientation
             np.array([0.0]),                     # [1] delta_yaw (masked with 0*)
-            np.array([0.0]),                     # [1] delta_yaw (actual)
-            np.array([0.0]),                     # [1] delta_next_yaw
+            np.array([delta_yaw_sin]),           # [1] delta_yaw_sin (from depth encoder)
+            np.array([delta_yaw_cos]),           # [1] delta_yaw_cos (from depth encoder)
             np.array([0.0, 0.0]),                # [2] commands (masked with 0*)
             np.array([cmd_vel_x]),               # [1] forward velocity command
             np.array([1.0]),                     # [1] env_class != 17
@@ -260,7 +278,7 @@ class PolicyRunner:
         """
         Run full inference pipeline.
 
-        Reads depth embedding from shared memory (from depth encoder process).
+        Reads depth embedding and yaw prediction from shared memory (from depth encoder process).
         Writes proprio to shared memory for depth encoder.
 
         Args:
@@ -273,9 +291,13 @@ class PolicyRunner:
         Returns:
             Tuple of (joint position targets in SDK order [12], raw actions for logging [12])
         """
-        # Build proprioceptive observation
+        # Read yaw prediction from shared memory (from depth encoder process)
+        yaw_pred = self.get_yaw_pred_from_shared()
+
+        # Build proprioceptive observation with yaw prediction
         proprio = self.build_proprio_obs(
-            ang_vel, roll, pitch, dof_pos, dof_vel, foot_contacts, cmd_vel_x
+            ang_vel, roll, pitch, dof_pos, dof_vel, foot_contacts, cmd_vel_x,
+            yaw_pred=yaw_pred
         )
 
         # Write proprio to shared memory for depth encoder process
