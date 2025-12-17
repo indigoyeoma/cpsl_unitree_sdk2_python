@@ -108,11 +108,12 @@ class Go2Deployment:
         self.target_pos = DEFAULT_STAND_ANGLES_SDK.copy()
         self.current_target = DEFAULT_STAND_ANGLES_SDK.copy()
 
-        # Standing/sitting interpolation (time-based like Unitree example)
+        # Standing/sitting interpolation (tick-based like Unitree example)
+        # Unitree uses: percent += 1.0 / duration_ticks each tick
         self.interp_start_pos = np.zeros(12, dtype=np.float32)
         self.interp_target_pos = np.zeros(12, dtype=np.float32)
-        self.interp_progress = 0.0
-        self.interp_duration = STAND_UP_DURATION  # Will be set per state
+        self.interp_percent = 0.0
+        self.interp_duration_ticks = 500  # 500 ticks @ 500Hz = 1 second
 
         # Components
         self.camera: Optional[DepthCamera] = None
@@ -462,8 +463,14 @@ class Go2Deployment:
         remote = self.low_state.wireless_remote
         return remote[2] | (remote[3] << 8)
 
-    def _init_interpolation(self, target_pos: np.ndarray, duration: float):
-        """Initialize position interpolation from current position to target."""
+    def _init_interpolation(self, target_pos: np.ndarray, duration_ticks: int = 500):
+        """
+        Initialize position interpolation (exactly like Unitree example).
+
+        Args:
+            target_pos: Target joint positions
+            duration_ticks: Number of ticks for interpolation (500 ticks @ 500Hz = 1 second)
+        """
         if self.low_state is not None:
             self.interp_start_pos = np.array([
                 self.low_state.motor_state[i].q for i in range(12)
@@ -471,31 +478,30 @@ class Go2Deployment:
         else:
             self.interp_start_pos = DEFAULT_STAND_ANGLES_SDK.copy()
         self.interp_target_pos = target_pos.copy()
-        self.interp_duration = duration
-        self.interp_progress = 0.0
+        self.interp_duration_ticks = duration_ticks
+        self.interp_percent = 0.0
 
     def _compute_interpolation(self) -> np.ndarray:
         """
-        Compute time-based linear interpolation (like Unitree example).
-        Linearly interpolates from start position to target position.
+        Compute tick-based linear interpolation (exactly like Unitree example).
 
-        Returns:
-            Joint position targets in SDK order [12]
+        Unitree code:
+            self.percent_1 += 1.0 / self.duration_1
+            self.percent_1 = min(self.percent_1, 1)
+            q = (1 - percent) * startPos + percent * targetPos
         """
-        # Increment progress (same as Unitree: percent += 1.0 / duration_ticks)
-        self.interp_progress += MOTOR_DT / self.interp_duration
-        self.interp_progress = min(self.interp_progress, 1.0)
+        # Increment percent (exactly like Unitree)
+        self.interp_percent += 1.0 / self.interp_duration_ticks
+        self.interp_percent = min(self.interp_percent, 1.0)
 
-        # Linear interpolation (exactly like Unitree example)
-        # q = (1 - percent) * startPos + percent * targetPos
-        t = self.interp_progress
-        target = (1.0 - t) * self.interp_start_pos + t * self.interp_target_pos
+        # Linear interpolation (exactly like Unitree)
+        target = (1.0 - self.interp_percent) * self.interp_start_pos + self.interp_percent * self.interp_target_pos
 
         return target
 
     def _is_interpolation_complete(self) -> bool:
         """Check if interpolation is complete."""
-        return self.interp_progress >= 1.0
+        return self.interp_percent >= 1.0
 
     def _enter_state(self, new_state: State):
         """Transition to a new state."""
@@ -505,16 +511,16 @@ class Go2Deployment:
 
         # State entry actions
         if new_state == State.STANDING_UP:
-            # Initialize time-based interpolation to stand pose
-            self._init_interpolation(DEFAULT_STAND_ANGLES_SDK, STAND_UP_DURATION)
+            # Initialize interpolation to stand pose (500 ticks = 1 second, like Unitree)
+            self._init_interpolation(DEFAULT_STAND_ANGLES_SDK, duration_ticks=500)
             print("STATE: Standing up...")
 
         elif new_state == State.STANDING:
             print("STATE: Standing - press L1 to walk, Y to sit")
 
         elif new_state == State.SITTING_DOWN:
-            # Initialize time-based interpolation to sit pose
-            self._init_interpolation(SIT_ANGLES_SDK, SIT_DOWN_DURATION)
+            # Initialize interpolation to sit pose (500 ticks = 1 second, like Unitree)
+            self._init_interpolation(SIT_ANGLES_SDK, duration_ticks=500)
             print("STATE: Sitting down...")
 
         elif new_state == State.WALKING:
