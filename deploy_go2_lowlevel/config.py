@@ -1,191 +1,159 @@
 """
-Configuration for Go2 Vision Policy Deployment
-Adapted from cpsl_go2_rl_repo/legged_gym/envs/go2/go2_parkour_config.py
+Configuration for Go2 vision policy deployment.
+Matches training parameters from cpsl_go2_rl_repo.
 """
-
 import numpy as np
 
+# =============================================================================
+# Control Timing
+# =============================================================================
+CONTROL_DT = 0.02          # 50Hz policy (decimation=4 from 200Hz sim)
+MOTOR_DT = 0.002           # 500Hz motor control loop
+POLICY_DECIMATION = 10     # Run policy every 10 motor ticks (500Hz / 10 = 50Hz)
 
-class DeployConfig:
-    """Deployment configuration for Go2 vision-based policy"""
+# =============================================================================
+# PD Gains (matching training)
+# =============================================================================
+KP_WALK = 25.0             # Walking stiffness [N*m/rad]
+KD_WALK = 0.6              # Walking damping [N*m*s/rad]
+KP_STAND = 70.0            # Standing stiffness (higher for stability)
+KD_STAND = 3.0             # Standing damping
 
-    # Control parameters (must match training config)
-    control_dt = 0.02  # 50Hz policy (decimation=4 @ 200Hz sim)
-    action_scale = 0.25
-    clip_actions = 1.2  # Action clipping (matches training - ±4.8 raw → ±1.2 rad)
+# =============================================================================
+# Action Scaling
+# =============================================================================
+ACTION_SCALE = 0.25        # Policy output scale
 
-    # PD gains for WALKING (must match training for sim2real)
-    # Training uses: kp=25.0, kd=0.6
-    kp_walk = 25.0  # stiffness for walking (matches training)
-    kd_walk = 0.6   # damping for walking (matches training)
+# =============================================================================
+# Observation Dimensions
+# =============================================================================
+N_PROPRIO = 53             # Proprioceptive observation size
+N_SCAN = 132               # Height scan (placeholder, filled with zeros for vision)
+N_PRIV_EXPLICIT = 9        # Privileged explicit info (estimated by network)
+N_PRIV_LATENT = 29         # Privileged latent info (placeholder)
+HISTORY_LEN = 10           # History length (10 frames * 53 proprio = 530)
 
-    # PD gains for STANDING (higher for stability)
-    # From Unitree SDK examples - stiffer for holding position
-    kp_stand = 70.0  # stiffness for standing
-    kd_stand = 3.0   # damping for standing
+# Total observation size
+N_OBS = N_PROPRIO + N_SCAN + N_PRIV_EXPLICIT + N_PRIV_LATENT + HISTORY_LEN * N_PROPRIO  # 753
 
-    # Default (will be switched based on phase)
-    kp = 70.0
-    kd = 3.0
+# Depth encoder output
+DEPTH_LATENT_DIM = 32      # Depth encoder latent dimension
 
-    # Default standing pose (from training config)
-    # Training simulation order: FL, FR, RL, RR
-    default_joint_angles_sim = np.array([
-        0.1, 0.8, -1.5,   # FL: hip, thigh, calf
-        -0.1, 0.8, -1.5,  # FR: hip, thigh, calf
-        0.1, 1.0, -1.5,   # RL: hip, thigh, calf
-        -0.1, 1.0, -1.5,  # RR: hip, thigh, calf
-    ], dtype=np.float32)
+# =============================================================================
+# Observation Scales (matching training)
+# =============================================================================
+class ObsScales:
+    lin_vel = 2.0          # Linear velocity scale
+    ang_vel = 0.25         # Angular velocity scale
+    dof_pos = 1.0          # Joint position scale
+    dof_vel = 0.05         # Joint velocity scale
 
-    # SDK/Observation order: FR, FL, RR, RL (matches training after reindex)
-    # This is what the policy actually sees during training
-    default_joint_angles = np.array([
-        -0.1, 0.8, -1.5,  # FR: hip, thigh, calf
-        0.1, 0.8, -1.5,   # FL: hip, thigh, calf
-        -0.1, 1.0, -1.5,  # RR: hip, thigh, calf
-        0.1, 1.0, -1.5,   # RL: hip, thigh, calf
-    ], dtype=np.float32)
+# =============================================================================
+# Joint Ordering
+# SDK order:      [FR_hip, FR_thigh, FR_calf, FL_hip, FL_thigh, FL_calf,
+#                  RR_hip, RR_thigh, RR_calf, RL_hip, RL_thigh, RL_calf]
+# Training order: [FL_hip, FL_thigh, FL_calf, FR_hip, FR_thigh, FR_calf,
+#                  RL_hip, RL_thigh, RL_calf, RR_hip, RR_thigh, RR_calf]
+# =============================================================================
 
-    # Joint order mapping between training (URDF) and Unitree SDK
-    # Training order: FL, FR, RL, RR (hip, thigh, calf for each)
-    # SDK order: FR, FL, RR, RL (hip, thigh, calf for each)
-    training_to_sdk_idx = [
-        3, 4, 5,    # FL_hip, FL_thigh, FL_calf -> SDK indices 3,4,5
-        0, 1, 2,    # FR_hip, FR_thigh, FR_calf -> SDK indices 0,1,2
-        9, 10, 11,  # RL_hip, RL_thigh, RL_calf -> SDK indices 9,10,11
-        6, 7, 8,    # RR_hip, RR_thigh, RR_calf -> SDK indices 6,7,8
-    ]
+# From SDK order to Training order (for building observations)
+SDK_TO_TRAIN_JOINTS = [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
 
-    # SDK to training order
-    sdk_to_training_idx = [
-        3, 4, 5,    # FR (SDK 0,1,2) -> training FL (3,4,5) - wait this is wrong
-        0, 1, 2,    # FL (SDK 3,4,5) -> training FL (0,1,2)
-        9, 10, 11,  # RR (SDK 6,7,8) -> training RR (9,10,11) - wrong
-        6, 7, 8,    # RL (SDK 9,10,11) -> training RL (6,7,8)
-    ]
+# From Training order to SDK order (for applying actions)
+TRAIN_TO_SDK_JOINTS = [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]  # Same mapping
 
-    # Actually, let me reconsider the mapping:
-    # Training URDF order: FL_hip(0), FL_thigh(1), FL_calf(2), FR(3,4,5), RL(6,7,8), RR(9,10,11)
-    # Wait, from config: FL, RL, FR, RR - let's check the config again
-    # From go2_parkour_config.py:
-    # 'FL_hip_joint': 0.1, 'RL_hip_joint': 0.1, 'FR_hip_joint': -0.1, 'RR_hip_joint': -0.1,
-    # 'FL_thigh_joint': 0.8, ...
+# Feet ordering: SDK [FR, FL, RR, RL] -> Training [FL, FR, RL, RR]
+SDK_TO_TRAIN_FEET = [1, 0, 3, 2]
 
-    # The default_joint_angles in config lists joints individually, but the action space
-    # is typically ordered FL, FR, RL, RR (Isaac Gym convention)
-    # SDK order: FR_0, FR_1, FR_2, FL_0, FL_1, FL_2, RR_0, RR_1, RR_2, RL_0, RL_1, RL_2
+# =============================================================================
+# Default Standing Pose (SDK order)
+# =============================================================================
+DEFAULT_STAND_ANGLES_SDK = np.array([
+    -0.1, 0.8, -1.5,    # FR: hip, thigh, calf
+     0.1, 0.8, -1.5,    # FL: hip, thigh, calf
+    -0.1, 1.0, -1.5,    # RR: hip, thigh, calf
+     0.1, 1.0, -1.5,    # RL: hip, thigh, calf
+], dtype=np.float32)
 
-    # Corrected mapping:
-    # Training output (action): [FL_hip, FL_thigh, FL_calf, FR_*, RL_*, RR_*]
-    # SDK expects: [FR_*, FL_*, RR_*, RL_*]
+# Default pose in training order (for policy offset)
+DEFAULT_STAND_ANGLES_TRAIN = DEFAULT_STAND_ANGLES_SDK[SDK_TO_TRAIN_JOINTS]
 
-    # Depth camera config (D435i on Go2 head - must match training)
-    # D435i minimum reliable depth is ~0.3m
-    depth_width = 87
-    depth_height = 58
-    depth_fov = 86  # horizontal FOV in degrees (D435i spec)
-    depth_near = 0.3  # D435i minimum reliable depth
-    depth_far = 3.0   # Maximum depth range
-    depth_scale = 1.0
-
-    # Observation dimensions (must match training)
-    n_proprio = 53  # proprioceptive observation dimension
-    n_scan = 132    # terrain scan (teacher) or depth latent (student)
-    history_len = 10
-    n_priv_explicit = 9  # 3 + 3 + 3 (base_lin_vel copies)
-    n_priv_latent = 29   # 4 + 1 + 12 + 12 (mass, friction, motor_strength)
-
-    # Command velocity (for forward walking)
-    command_vx = 0.3  # Forward velocity command (m/s), range: 0.0 - 1.0
-
-    # Goal-based navigation (matching training)
-    goal_distance = 1.0  # Distance to place goal ahead (meters)
-    goal_update_threshold = 0.3  # Update goal when within this distance (meters)
-    next_goal_distance = 2.0  # Distance for next waypoint
-    lin_vel_scale = 2.0  # Observation scale for linear velocity/commands
-
-    # Model paths (relative to this file, update as needed)
-    model_path = ""  # Set this when running
-
-
-# Joint limits for safety
-class JointLimits:
-    """Go2 joint limits in radians"""
-    hip_min = -1.047    # -60 deg
-    hip_max = 1.047     # 60 deg
-    thigh_min = -1.5    # ~-86 deg
-    thigh_max = 3.4     # ~195 deg
-    calf_min = -2.7     # ~-155 deg
-    calf_max = -0.83    # ~-48 deg
-
-    # Torque limits per joint type (Nm) - from Go2 specs
-    # Order: FR, FL, RR, RL (SDK order)
-    torque_limits = np.array([
-        25.0, 40.0, 40.0,  # FR: hip, thigh, calf
-        25.0, 40.0, 40.0,  # FL
-        25.0, 40.0, 40.0,  # RR
-        25.0, 40.0, 40.0,  # RL
-    ], dtype=np.float32)
-
-    @staticmethod
-    def clip_joints(joints):
-        """Clip joint angles to safe limits"""
-        clipped = np.copy(joints)
-        for i in range(4):  # 4 legs
-            base = i * 3
-            clipped[base] = np.clip(joints[base], JointLimits.hip_min, JointLimits.hip_max)
-            clipped[base+1] = np.clip(joints[base+1], JointLimits.thigh_min, JointLimits.thigh_max)
-            clipped[base+2] = np.clip(joints[base+2], JointLimits.calf_min, JointLimits.calf_max)
-        return clipped
-
-    @staticmethod
-    def clip_by_torque_limit(target_pos, current_pos, current_vel, kp, kd, torque_limits=None):
-        """
-        Clip target positions based on torque limits (from parkour).
-
-        Prevents commanding positions that would require excessive torque.
-        Uses inverse PD equation: torque = kp * (target - current) - kd * vel
-
-        Args:
-            target_pos: Target joint positions (12,)
-            current_pos: Current joint positions (12,)
-            current_vel: Current joint velocities (12,)
-            kp: Position gain
-            kd: Damping gain
-            torque_limits: Max torque per joint (12,), uses default if None
-
-        Returns:
-            Clipped target positions
-        """
-        if torque_limits is None:
-            torque_limits = JointLimits.torque_limits
-
-        # Compute position limits based on torque limits
-        # From: tau = kp * (target - current) - kd * vel
-        # Solve for target: target = current + (tau + kd * vel) / kp
-        pos_delta_max = (torque_limits + kd * current_vel) / kp
-        pos_delta_min = (-torque_limits + kd * current_vel) / kp
-
-        # Compute allowed position range
-        pos_max = current_pos + pos_delta_max
-        pos_min = current_pos + pos_delta_min
-
-        # Ensure min < max
-        pos_min_final = np.minimum(pos_min, pos_max)
-        pos_max_final = np.maximum(pos_min, pos_max)
-
-        # Clip target positions
-        clipped = np.clip(target_pos, pos_min_final, pos_max_final)
-        return clipped
-
-
-# Joint ordering constants (matching unitree_legged_const.py)
-LegID = {
-    "FR_0": 0, "FR_1": 1, "FR_2": 2,
-    "FL_0": 3, "FL_1": 4, "FL_2": 5,
-    "RR_0": 6, "RR_1": 7, "RR_2": 8,
-    "RL_0": 9, "RL_1": 10, "RL_2": 11,
+# =============================================================================
+# Joint Limits (SDK order) - for safety clipping
+# =============================================================================
+JOINT_POS_LIMITS = {
+    'hip_min': -1.047,     # -60 degrees
+    'hip_max': 1.047,      # +60 degrees
+    'thigh_min': -1.5,     # ~-86 degrees
+    'thigh_max': 3.4,      # ~195 degrees
+    'calf_min': -2.7,      # ~-155 degrees
+    'calf_max': -0.83,     # ~-48 degrees
 }
 
-PosStopF = 2.146e9
-VelStopF = 16000.0
+# Per-joint limits in SDK order
+JOINT_POS_MIN = np.array([
+    JOINT_POS_LIMITS['hip_min'], JOINT_POS_LIMITS['thigh_min'], JOINT_POS_LIMITS['calf_min'],  # FR
+    JOINT_POS_LIMITS['hip_min'], JOINT_POS_LIMITS['thigh_min'], JOINT_POS_LIMITS['calf_min'],  # FL
+    JOINT_POS_LIMITS['hip_min'], JOINT_POS_LIMITS['thigh_min'], JOINT_POS_LIMITS['calf_min'],  # RR
+    JOINT_POS_LIMITS['hip_min'], JOINT_POS_LIMITS['thigh_min'], JOINT_POS_LIMITS['calf_min'],  # RL
+], dtype=np.float32)
+
+JOINT_POS_MAX = np.array([
+    JOINT_POS_LIMITS['hip_max'], JOINT_POS_LIMITS['thigh_max'], JOINT_POS_LIMITS['calf_max'],  # FR
+    JOINT_POS_LIMITS['hip_max'], JOINT_POS_LIMITS['thigh_max'], JOINT_POS_LIMITS['calf_max'],  # FL
+    JOINT_POS_LIMITS['hip_max'], JOINT_POS_LIMITS['thigh_max'], JOINT_POS_LIMITS['calf_max'],  # RR
+    JOINT_POS_LIMITS['hip_max'], JOINT_POS_LIMITS['thigh_max'], JOINT_POS_LIMITS['calf_max'],  # RL
+], dtype=np.float32)
+
+# Torque limits per joint type
+TORQUE_LIMITS = np.array([
+    25.0, 40.0, 40.0,   # FR: hip, thigh, calf
+    25.0, 40.0, 40.0,   # FL
+    25.0, 40.0, 40.0,   # RR
+    25.0, 40.0, 40.0,   # RL
+], dtype=np.float32)
+
+# =============================================================================
+# Depth Camera Settings (D435i)
+# =============================================================================
+DEPTH_WIDTH = 640          # Native capture width
+DEPTH_HEIGHT = 480         # Native capture height
+DEPTH_FPS = 30             # Frame rate
+
+# Cropping (matching training proportions)
+# Training: 106x60 with crop_top=6, crop_left=5, crop_right=6
+# Deployment: 640x480 scaled proportionally
+CROP_TOP = 48              # 480 * 0.10 = 48
+CROP_BOTTOM = 0
+CROP_LEFT = 28             # 640 * 0.044 = 28
+CROP_RIGHT = 36            # 640 * 0.056 = 36
+
+# Output resolution (matching training)
+DEPTH_OUTPUT_WIDTH = 87
+DEPTH_OUTPUT_HEIGHT = 58
+
+# Depth range
+DEPTH_NEAR = 0.3           # meters (D435i min)
+DEPTH_FAR = 3.0            # meters
+
+# =============================================================================
+# Fixed Velocity Command
+# =============================================================================
+FIXED_VEL_X = 0.5          # Forward velocity [m/s]
+FIXED_VEL_Y = 0.0          # Lateral velocity [m/s]
+FIXED_VEL_YAW = 0.0        # Yaw rate [rad/s]
+
+# =============================================================================
+# Standing Sequence Timing
+# =============================================================================
+STAND_UP_DURATION = 1.5    # seconds to interpolate to stand
+SIT_DOWN_DURATION = 1.0    # seconds to interpolate to sit
+
+# =============================================================================
+# Model Paths (relative to this file's directory)
+# =============================================================================
+import os
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(_THIS_DIR, "policy")
+BASE_JIT_PATH = os.path.join(MODEL_DIR, "go2_student-15000-base_jit.pt")
+VISION_WEIGHT_PATH = os.path.join(MODEL_DIR, "go2_student-15000-vision_weight.pt")

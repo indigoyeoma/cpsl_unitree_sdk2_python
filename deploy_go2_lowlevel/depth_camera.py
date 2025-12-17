@@ -1,307 +1,286 @@
 """
-Intel RealSense D435i Depth Camera Interface for Go2 Vision Policy Deployment
-"""
+Intel RealSense D435i depth camera interface for Go2 deployment.
+Captures depth frames and preprocesses them for the vision policy.
 
+Camera is mounted UPRIGHT (no rotation needed, unlike parkour code).
+"""
 import numpy as np
-import cv2
 import threading
 import time
+from typing import Optional, Tuple
 
 try:
     import pyrealsense2 as rs
-    REALSENSE_AVAILABLE = True
+    HAS_REALSENSE = True
 except ImportError:
-    REALSENSE_AVAILABLE = False
-    print("Warning: pyrealsense2 not available. Using dummy depth camera.")
+    HAS_REALSENSE = False
+    print("WARNING: pyrealsense2 not installed. Using dummy depth frames.")
+
+from config import (
+    DEPTH_WIDTH, DEPTH_HEIGHT, DEPTH_FPS,
+    CROP_TOP, CROP_BOTTOM, CROP_LEFT, CROP_RIGHT,
+    DEPTH_OUTPUT_WIDTH, DEPTH_OUTPUT_HEIGHT,
+    DEPTH_NEAR, DEPTH_FAR
+)
 
 
-class D435iCamera:
+class DepthCamera:
     """
-    Interface for Intel RealSense D435i depth camera.
+    Intel RealSense D435i depth camera wrapper.
 
-    Captures depth images and processes them for policy input.
-    D435i specs: 86° x 57° FOV, up to 1280x720 @30fps depth
+    Captures depth frames in a background thread and provides
+    preprocessed frames for the vision policy.
     """
 
-    def __init__(
-        self,
-        width: int = 640,       # Match parkour resolution exactly
-        height: int = 480,      # Match parkour resolution exactly
-        fps: int = 30,
-        target_width: int = 87,
-        target_height: int = 58,
-        near_clip: float = 0.3,
-        far_clip: float = 3.0,
-        rotate_180: bool = False,  # Default False - only enable if camera mounted inverted
-        # Cropping settings - MORE aggressive left crop to remove D435i edge artifact
-        # Parkour uses crop_left=28 but our D435i has artifact extending to cols 0-3 after resize
-        # Increase left crop to remove ~5% more (640 * 0.09 ≈ 58)
-        crop_left: int = 58,    # Increased from 28 to remove left edge artifact
-        crop_right: int = 36,   # Exact parkour value
-        crop_top: int = 48,     # Exact parkour value
-        crop_bottom: int = 0,   # Exact parkour value
-    ):
+    def __init__(self, enable_filters: bool = True):
         """
-        Initialize D435i camera.
+        Initialize the depth camera.
 
         Args:
-            width: Capture width (640 to match parkour exactly)
-            height: Capture height (480 to match parkour exactly)
-            fps: Capture framerate
-            target_width: Output width for policy (after resize)
-            target_height: Output height for policy (after resize)
-            near_clip: Minimum depth in meters
-            far_clip: Maximum depth in meters
-            rotate_180: Rotate image 180 degrees (for inverted camera mounting)
-            crop_left/right/top/bottom: Pixels to crop from each edge (parkour defaults)
+            enable_filters: Whether to apply RealSense post-processing filters
         """
-        self.width = width
-        self.height = height
-        self.fps = fps
-        self.target_width = target_width
-        self.target_height = target_height
-        self.near_clip = near_clip
-        self.far_clip = far_clip
-        self.rotate_180 = rotate_180
-        self.crop_left = crop_left
-        self.crop_right = crop_right
-        self.crop_top = crop_top
-        self.crop_bottom = crop_bottom
-
+        self.enable_filters = enable_filters
         self.pipeline = None
         self.config = None
         self.running = False
-        self.latest_depth = None
-        self.latest_depth_lock = threading.Lock()
-        self.capture_thread = None
+        self.thread = None
 
-        if not REALSENSE_AVAILABLE:
-            print("RealSense not available - using dummy depth images")
+        # Latest frame storage (thread-safe)
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_timestamp: float = 0.0
 
-    def start(self):
-        """Start the depth camera capture."""
-        if not REALSENSE_AVAILABLE:
+        # Initialize filters if enabled
+        if enable_filters and HAS_REALSENSE:
+            self._init_filters()
+
+    def _init_filters(self):
+        """Initialize RealSense post-processing filters."""
+        # Hole filling filter
+        self.hole_filter = rs.hole_filling_filter()
+
+        # Spatial filter (edge-preserving smoothing)
+        self.spatial_filter = rs.spatial_filter()
+        self.spatial_filter.set_option(rs.option.filter_magnitude, 5)
+        self.spatial_filter.set_option(rs.option.filter_smooth_alpha, 0.75)
+        self.spatial_filter.set_option(rs.option.filter_smooth_delta, 1)
+        self.spatial_filter.set_option(rs.option.holes_fill, 4)
+
+        # Temporal filter (reduces noise over time)
+        self.temporal_filter = rs.temporal_filter()
+        self.temporal_filter.set_option(rs.option.filter_smooth_alpha, 0.75)
+        self.temporal_filter.set_option(rs.option.filter_smooth_delta, 1)
+
+        self.filters = [self.hole_filter, self.spatial_filter, self.temporal_filter]
+
+    def start(self) -> bool:
+        """
+        Start the camera capture.
+
+        Returns:
+            True if started successfully, False otherwise
+        """
+        if not HAS_REALSENSE:
+            print("RealSense not available, using dummy frames")
             self.running = True
-            return
+            return True
 
-        self.pipeline = rs.pipeline()
-        self.config = rs.config()
-
-        # Configure depth stream
-        self.config.enable_stream(
-            rs.stream.depth,
-            self.width,
-            self.height,
-            rs.format.z16,
-            self.fps
-        )
-
-        # Start streaming
-        profile = self.pipeline.start(self.config)
-
-        # Get depth scale for converting to meters
-        depth_sensor = profile.get_device().first_depth_sensor()
-        self.depth_scale = depth_sensor.get_depth_scale()
-
-        # Set medium density preset for balanced performance
         try:
-            depth_sensor.set_option(rs.option.visual_preset, 5)  # Medium Density
-            print(f"✓ Medium Density mode enabled (balanced quality & speed)")
+            self.pipeline = rs.pipeline()
+            self.config = rs.config()
+
+            # Configure depth stream
+            self.config.enable_stream(
+                rs.stream.depth,
+                DEPTH_WIDTH,
+                DEPTH_HEIGHT,
+                rs.format.z16,
+                DEPTH_FPS
+            )
+
+            # Start pipeline
+            self.pipeline.start(self.config)
+
+            # Wait for auto-exposure to stabilize
+            for _ in range(30):
+                self.pipeline.wait_for_frames()
+
+            self.running = True
+
+            # Start background capture thread
+            self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self.thread.start()
+
+            print(f"Depth camera started: {DEPTH_WIDTH}x{DEPTH_HEIGHT} @ {DEPTH_FPS}fps")
+            return True
+
         except Exception as e:
-            print(f"Could not set visual preset: {e}")
+            print(f"Failed to start depth camera: {e}")
+            return False
 
-        # Build RealSense filters (from parkour go2_visual.py)
-        # These improve depth quality significantly
-        self.rs_hole_filling_filter = rs.hole_filling_filter()
-        self.rs_spatial_filter = rs.spatial_filter()
-        self.rs_spatial_filter.set_option(rs.option.filter_magnitude, 5)
-        self.rs_spatial_filter.set_option(rs.option.filter_smooth_alpha, 0.75)
-        self.rs_spatial_filter.set_option(rs.option.filter_smooth_delta, 1)
-        self.rs_spatial_filter.set_option(rs.option.holes_fill, 4)
-        self.rs_temporal_filter = rs.temporal_filter()
-        self.rs_temporal_filter.set_option(rs.option.filter_smooth_alpha, 0.75)
-        self.rs_temporal_filter.set_option(rs.option.filter_smooth_delta, 1)
-
-        # Filter pipeline order (from parkour)
-        self.rs_filters = [
-            self.rs_hole_filling_filter,
-            self.rs_spatial_filter,
-            self.rs_temporal_filter,
-        ]
-        print(f"✓ RealSense filters enabled (hole filling, spatial, temporal)")
-
-        self.running = True
-
-        # Start background capture thread
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
-        self.capture_thread.start()
-
-        print(f"D435i camera started: {self.width}x{self.height}@{self.fps}fps")
+    def stop(self):
+        """Stop the camera capture."""
+        self.running = False
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except:
+                pass
+        print("Depth camera stopped")
 
     def _capture_loop(self):
         """Background thread for continuous frame capture."""
         while self.running:
             try:
-                frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+                frames = self.pipeline.wait_for_frames(timeout_ms=100)
                 depth_frame = frames.get_depth_frame()
 
-                if depth_frame:
-                    # Apply RealSense filters (from parkour)
-                    for rs_filter in self.rs_filters:
-                        depth_frame = rs_filter.process(depth_frame)
+                if not depth_frame:
+                    continue
 
-                    depth_image = self._process_depth_frame(depth_frame)
-                    with self.latest_depth_lock:
-                        self.latest_depth = depth_image
+                # Apply filters
+                if self.enable_filters:
+                    for f in self.filters:
+                        depth_frame = f.process(depth_frame)
+
+                # Convert to numpy array
+                depth_image = np.asanyarray(depth_frame.get_data())
+
+                # Preprocess for policy
+                processed = self._preprocess(depth_image)
+
+                # Store with thread safety
+                with self._frame_lock:
+                    self._latest_frame = processed
+                    self._frame_timestamp = time.time()
+
             except Exception as e:
                 if self.running:
                     print(f"Depth capture error: {e}")
                 time.sleep(0.01)
 
-    def _process_depth_frame(self, depth_frame) -> np.ndarray:
+    def _preprocess(self, depth_image: np.ndarray) -> np.ndarray:
         """
-        Process raw depth frame to policy input format.
-
-        IMPORTANT: This MUST match training preprocessing exactly!
-        Processing order (matching CPSL training):
-        1. Rotate 180° (if camera inverted)
-        2. Crop edges (training uses [:-2, 4:-4])
-        3. Clip depth range
-        4. Resize to target (87x58)
-        5. Normalize to [-0.5, 0.5]
-        6. Fix edge artifacts
+        Preprocess depth image for the vision policy.
 
         Args:
-            depth_frame: RealSense depth frame
+            depth_image: Raw depth image from camera (H, W) in millimeters
 
         Returns:
-            Processed depth image (target_height x target_width), normalized [-0.5, 0.5]
+            Normalized depth image (DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH)
         """
-        # Convert to numpy array (in millimeters for z16)
-        depth_image = np.asanyarray(depth_frame.get_data()).astype(np.float32)
+        # Camera is UPRIGHT - no rotation needed (unlike parkour which rotates 180)
 
-        # STEP 1: Rotate 180 degrees if camera is mounted inverted
-        if self.rotate_180:
-            depth_image = np.rot90(depth_image, k=2)  # k=2 for 180 degree rotation
+        # Crop edges
+        h, w = depth_image.shape
+        crop_h_end = h - CROP_BOTTOM if CROP_BOTTOM > 0 else h
+        crop_w_end = w - CROP_RIGHT if CROP_RIGHT > 0 else w
 
-        # Convert to meters (negative as in Isaac Gym depth)
-        depth_image = -depth_image * self.depth_scale
+        cropped = depth_image[CROP_TOP:crop_h_end, CROP_LEFT:crop_w_end]
 
-        # STEP 2: CROP edges (matching CPSL training)
-        # Training uses [:-2, 4:-4] on 106x60 → we use similar ratio on 424x240
-        top = self.crop_top if self.crop_top > 0 else None
-        bottom = -self.crop_bottom if self.crop_bottom > 0 else None
-        left = self.crop_left if self.crop_left > 0 else None
-        right = -self.crop_right if self.crop_right > 0 else None
+        # Convert to meters (from mm)
+        depth_m = cropped.astype(np.float32) / 1000.0
 
-        # Build slice - handle None cases
-        row_start = top if top else 0
-        row_end = bottom  # None means to end
-        col_start = left if left else 0
-        col_end = right  # None means to end
+        # Clip to valid range
+        depth_m = np.clip(depth_m, DEPTH_NEAR, DEPTH_FAR)
 
-        depth_image = depth_image[row_start:row_end, col_start:col_end]
+        # Resize to policy input size
+        resized = self._resize(depth_m, (DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH))
 
-        # STEP 3: Clip to valid range (negative values!)
-        depth_image = np.clip(depth_image, -self.far_clip, -self.near_clip)
+        # Normalize to [0, 1]
+        normalized = (resized - DEPTH_NEAR) / (DEPTH_FAR - DEPTH_NEAR)
 
-        # STEP 4: Resize to target dimensions (87x58)
-        depth_image = cv2.resize(
-            depth_image,
-            (self.target_width, self.target_height),
-            interpolation=cv2.INTER_AREA
-        )
+        return normalized.astype(np.float32)
 
-        # STEP 5: Normalize (matching training exactly)
-        # Training formula: (depth - near) / (far - near) - 0.5
-        # This gives: close (0.3m) → -0.5, far (3.0m) → +0.5
-        depth_image = depth_image * -1  # Make positive (0.3m to 3.0m range)
-
-        # Match training normalization exactly:
-        # (depth - near_clip) / (far_clip - near_clip) - 0.5
-        depth_image = (depth_image - self.near_clip) / (self.far_clip - self.near_clip) - 0.5
-
-        # STEP 6: Fix left-edge artifacts (stuck pixels at -0.5 cause right-turning)
-        # Copy column 1 to column 0 to fix camera edge artifacts
-        depth_image[:, 0] = depth_image[:, 1]
-
-        # Result: range [-0.5, 0.5]
-        #   near (0.3m) → -0.5  (CLOSE = LOW)
-        #   far (3.0m) → +0.5   (FAR = HIGH)
-
-        return depth_image
-
-    def get_depth(self) -> np.ndarray:
+    def _resize(self, image: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
         """
-        Get latest depth image.
+        Resize image using area averaging (similar to BICUBIC downsampling).
+
+        Args:
+            image: Input image (H, W)
+            size: Target size (H, W)
 
         Returns:
-            Depth image (target_height x target_width), normalized 0-1
-            Returns zeros if no frame available
+            Resized image
         """
-        if not REALSENSE_AVAILABLE:
-            # Return dummy depth image for testing
-            return np.zeros((self.target_height, self.target_width), dtype=np.float32)
+        try:
+            import cv2
+            return cv2.resize(image, (size[1], size[0]), interpolation=cv2.INTER_AREA)
+        except ImportError:
+            # Fallback to simple nearest-neighbor if cv2 not available
+            h, w = image.shape
+            target_h, target_w = size
 
-        with self.latest_depth_lock:
-            if self.latest_depth is not None:
-                return self.latest_depth.copy()
-            else:
-                return np.zeros((self.target_height, self.target_width), dtype=np.float32)
+            row_indices = (np.arange(target_h) * h / target_h).astype(int)
+            col_indices = (np.arange(target_w) * w / target_w).astype(int)
 
-    def stop(self):
-        """Stop the camera capture."""
-        self.running = False
-        if self.capture_thread is not None:
-            self.capture_thread.join(timeout=2.0)
-        if self.pipeline is not None:
-            self.pipeline.stop()
-        print("D435i camera stopped")
+            return image[row_indices[:, None], col_indices]
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        """
+        Get the latest preprocessed depth frame.
+
+        Returns:
+            Preprocessed depth image (H, W) normalized to [0, 1], or None if no frame
+        """
+        if not HAS_REALSENSE:
+            # Return dummy frame for testing without camera
+            return self._get_dummy_frame()
+
+        with self._frame_lock:
+            if self._latest_frame is None:
+                return None
+            return self._latest_frame.copy()
+
+    def get_frame_age(self) -> float:
+        """
+        Get the age of the latest frame in seconds.
+
+        Returns:
+            Time since last frame was captured
+        """
+        with self._frame_lock:
+            if self._frame_timestamp == 0:
+                return float('inf')
+            return time.time() - self._frame_timestamp
+
+    def _get_dummy_frame(self) -> np.ndarray:
+        """Generate a dummy depth frame for testing without camera."""
+        # Create a simple gradient pattern
+        frame = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
+
+        # Add some structure - horizontal gradient
+        for i in range(DEPTH_OUTPUT_HEIGHT):
+            frame[i, :] = 0.3 + 0.4 * (i / DEPTH_OUTPUT_HEIGHT)
+
+        return frame
 
 
-class DummyCamera:
-    """Dummy camera for testing without hardware."""
+def test_camera():
+    """Test the depth camera."""
+    print("Testing depth camera...")
 
-    def __init__(self, target_width=87, target_height=58):
-        self.target_width = target_width
-        self.target_height = target_height
-        self.running = False
+    camera = DepthCamera(enable_filters=True)
 
-    def start(self):
-        self.running = True
-        print("Dummy camera started")
+    if not camera.start():
+        print("Failed to start camera")
+        return
 
-    def get_depth(self) -> np.ndarray:
-        # Return realistic depth: floor at bottom, far at top
-        # Simulates looking forward and down at flat ground
-        depth = np.zeros((self.target_height, self.target_width), dtype=np.float32)
-        for row in range(self.target_height):
-            # Top rows = far (+0.3), bottom rows = close (-0.4 = floor at ~0.5m)
-            t = row / (self.target_height - 1)  # 0 at top, 1 at bottom
-            depth[row, :] = 0.3 - 0.7 * t  # +0.3 at top, -0.4 at bottom
-        return depth
+    print("Camera started. Capturing 10 frames...")
 
-    def stop(self):
-        self.running = False
-        print("Dummy camera stopped")
+    for i in range(10):
+        time.sleep(0.1)
+        frame = camera.get_frame()
+        if frame is not None:
+            print(f"Frame {i+1}: shape={frame.shape}, min={frame.min():.3f}, max={frame.max():.3f}")
+        else:
+            print(f"Frame {i+1}: No frame available")
+
+    camera.stop()
+    print("Test complete")
 
 
-def create_camera(use_real: bool = True, **kwargs):
-    """
-    Factory function to create camera instance.
-
-    Args:
-        use_real: If True, try to use real D435i camera
-        **kwargs: Additional arguments for camera initialization
-            - rotate_180: Set True if camera is mounted inverted (like parkour Go2 setup)
-
-    Returns:
-        Camera instance (D435iCamera or DummyCamera)
-    """
-    if use_real and REALSENSE_AVAILABLE:
-        return D435iCamera(**kwargs)
-    else:
-        return DummyCamera(
-            target_width=kwargs.get('target_width', 87),
-            target_height=kwargs.get('target_height', 58)
-        )
+if __name__ == "__main__":
+    test_camera()
