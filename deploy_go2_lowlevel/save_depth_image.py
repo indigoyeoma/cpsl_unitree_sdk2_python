@@ -189,7 +189,7 @@ def save_images(raw_depth, filtered_depth, output_dir=".", prefix="depth"):
 
 def main():
     parser = argparse.ArgumentParser(description="Save depth camera images for debugging")
-    parser.add_argument("--output", "-o", default=".", help="Output directory")
+    parser.add_argument("--output", "-o", default="camera_debug", help="Output directory")
     parser.add_argument("--continuous", "-c", action="store_true", help="Continuous capture mode")
     parser.add_argument("--interval", type=float, default=1.0, help="Interval between captures (seconds)")
     args = parser.parse_args()
