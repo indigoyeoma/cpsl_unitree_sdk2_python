@@ -42,7 +42,8 @@ from config import (
     DEFAULT_STAND_ANGLES_SDK, JOINT_POS_MIN, JOINT_POS_MAX,
     STAND_UP_DURATION, SIT_DOWN_DURATION,
     FIXED_VEL_X, SDK_TO_TRAIN_JOINTS,
-    DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH
+    DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH,
+    DEPTH_NEAR, DEPTH_FAR
 )
 from depth_camera import DepthCamera
 from policy_runner import PolicyRunner
@@ -112,9 +113,11 @@ class Go2Deployment:
         self.running = False
         self.control_thread = None
 
-        # Logging (for dryrun mode)
+        # Logging (enabled for both dryrun and normal mode)
         self.log_file = None
-        self.log_entries = []
+        self.log_interval = 50  # Log every 50 ticks (10Hz at 500Hz loop)
+        self.last_depth_stats = {}
+        self.last_policy_output = None
         self.log_start_time = time.time()
 
     def init_low_cmd(self):
@@ -230,16 +233,16 @@ class Go2Deployment:
         print("=" * 60)
         print()
 
-        # Initialize logging for dryrun mode
-        if self.dryrun:
-            self._init_logging()
+        # Initialize logging (always enabled for debugging)
+        self._init_logging()
 
         return True
 
     def _init_logging(self):
-        """Initialize log file for dryrun mode."""
+        """Initialize log file for debugging."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = f"deploy_log_{timestamp}.txt"
+        mode_str = "DRYRUN" if self.dryrun else "LIVE"
+        log_filename = f"deploy_log_{mode_str}_{timestamp}.txt"
         log_path = os.path.join(os.path.dirname(__file__), log_filename)
 
         self.log_file = open(log_path, 'w')
@@ -247,21 +250,24 @@ class Go2Deployment:
 
         # Write header
         self.log_file.write("=" * 80 + "\n")
-        self.log_file.write(f"Go2 Deployment Log - DRYRUN MODE\n")
+        self.log_file.write(f"Go2 Deployment Log - {mode_str} MODE\n")
         self.log_file.write(f"Started: {datetime.now().isoformat()}\n")
         self.log_file.write("=" * 80 + "\n\n")
 
         # Write configuration
         self.log_file.write("## Configuration\n")
+        self.log_file.write(f"- Mode: {mode_str}\n")
         self.log_file.write(f"- Camera enabled: {not self.no_camera}\n")
         self.log_file.write(f"- Fixed velocity: {FIXED_VEL_X} m/s\n")
         self.log_file.write(f"- KP_WALK: {KP_WALK}, KD_WALK: {KD_WALK}\n")
+        self.log_file.write(f"- KP_STAND: {KP_STAND}, KD_STAND: {KD_STAND}\n")
         self.log_file.write(f"- ACTION_SCALE: {ACTION_SCALE}\n")
+        self.log_file.write(f"- Depth range: {DEPTH_NEAR}m - {DEPTH_FAR}m\n")
         self.log_file.write("\n")
 
         print(f"Logging to: {log_path}")
 
-    def _log_sensor_data(self, depth_stats: dict = None, policy_output: np.ndarray = None):
+    def _log_sensor_data(self, depth_stats: dict = None, policy_output: np.ndarray = None, extra_debug: dict = None):
         """Log sensor data to file."""
         if self.log_file is None or self.low_state is None:
             return
@@ -277,40 +283,83 @@ class Go2Deployment:
         foot_force = np.array([state.foot_force[i] for i in range(4)])
 
         # Write log entry
+        self.log_file.write(f"{'='*80}\n")
         self.log_file.write(f"--- Tick {self.policy_tick} | t={t:.3f}s | State: {self.state.name} ---\n")
+        self.log_file.write(f"{'='*80}\n")
 
         # IMU
-        self.log_file.write(f"IMU:\n")
-        self.log_file.write(f"  roll={rpy[0]:+.4f}, pitch={rpy[1]:+.4f}, yaw={rpy[2]:+.4f}\n")
-        self.log_file.write(f"  ang_vel=[{ang_vel[0]:+.4f}, {ang_vel[1]:+.4f}, {ang_vel[2]:+.4f}]\n")
+        self.log_file.write(f"\n[IMU]\n")
+        self.log_file.write(f"  roll={rpy[0]:+.4f} rad ({np.degrees(rpy[0]):+.2f} deg)\n")
+        self.log_file.write(f"  pitch={rpy[1]:+.4f} rad ({np.degrees(rpy[1]):+.2f} deg)\n")
+        self.log_file.write(f"  yaw={rpy[2]:+.4f} rad ({np.degrees(rpy[2]):+.2f} deg)\n")
+        self.log_file.write(f"  ang_vel=[{ang_vel[0]:+.4f}, {ang_vel[1]:+.4f}, {ang_vel[2]:+.4f}] rad/s\n")
 
         # Joints (SDK order: FR, FL, RR, RL)
-        self.log_file.write(f"Joint Positions (SDK order):\n")
-        self.log_file.write(f"  FR: [{dof_pos[0]:+.3f}, {dof_pos[1]:+.3f}, {dof_pos[2]:+.3f}]\n")
-        self.log_file.write(f"  FL: [{dof_pos[3]:+.3f}, {dof_pos[4]:+.3f}, {dof_pos[5]:+.3f}]\n")
-        self.log_file.write(f"  RR: [{dof_pos[6]:+.3f}, {dof_pos[7]:+.3f}, {dof_pos[8]:+.3f}]\n")
-        self.log_file.write(f"  RL: [{dof_pos[9]:+.3f}, {dof_pos[10]:+.3f}, {dof_pos[11]:+.3f}]\n")
+        self.log_file.write(f"\n[Joint Positions - ACTUAL (SDK order: FR,FL,RR,RL)]\n")
+        self.log_file.write(f"  FR (hip,thigh,calf): [{dof_pos[0]:+.4f}, {dof_pos[1]:+.4f}, {dof_pos[2]:+.4f}]\n")
+        self.log_file.write(f"  FL (hip,thigh,calf): [{dof_pos[3]:+.4f}, {dof_pos[4]:+.4f}, {dof_pos[5]:+.4f}]\n")
+        self.log_file.write(f"  RR (hip,thigh,calf): [{dof_pos[6]:+.4f}, {dof_pos[7]:+.4f}, {dof_pos[8]:+.4f}]\n")
+        self.log_file.write(f"  RL (hip,thigh,calf): [{dof_pos[9]:+.4f}, {dof_pos[10]:+.4f}, {dof_pos[11]:+.4f}]\n")
 
-        self.log_file.write(f"Joint Velocities (SDK order):\n")
+        # Default stand for comparison
+        default = DEFAULT_STAND_ANGLES_SDK
+        self.log_file.write(f"\n[Default Stand Angles (SDK order)]\n")
+        self.log_file.write(f"  FR: [{default[0]:+.4f}, {default[1]:+.4f}, {default[2]:+.4f}]\n")
+        self.log_file.write(f"  FL: [{default[3]:+.4f}, {default[4]:+.4f}, {default[5]:+.4f}]\n")
+        self.log_file.write(f"  RR: [{default[6]:+.4f}, {default[7]:+.4f}, {default[8]:+.4f}]\n")
+        self.log_file.write(f"  RL: [{default[9]:+.4f}, {default[10]:+.4f}, {default[11]:+.4f}]\n")
+
+        # Policy output (commanded positions)
+        if policy_output is not None:
+            self.log_file.write(f"\n[Policy Output - COMMANDED (SDK order)]\n")
+            self.log_file.write(f"  FR: [{policy_output[0]:+.4f}, {policy_output[1]:+.4f}, {policy_output[2]:+.4f}]\n")
+            self.log_file.write(f"  FL: [{policy_output[3]:+.4f}, {policy_output[4]:+.4f}, {policy_output[5]:+.4f}]\n")
+            self.log_file.write(f"  RR: [{policy_output[6]:+.4f}, {policy_output[7]:+.4f}, {policy_output[8]:+.4f}]\n")
+            self.log_file.write(f"  RL: [{policy_output[9]:+.4f}, {policy_output[10]:+.4f}, {policy_output[11]:+.4f}]\n")
+
+            # Error between commanded and actual
+            error = policy_output - dof_pos
+            self.log_file.write(f"\n[Position Error (commanded - actual)]\n")
+            self.log_file.write(f"  FR: [{error[0]:+.4f}, {error[1]:+.4f}, {error[2]:+.4f}]\n")
+            self.log_file.write(f"  FL: [{error[3]:+.4f}, {error[4]:+.4f}, {error[5]:+.4f}]\n")
+            self.log_file.write(f"  RR: [{error[6]:+.4f}, {error[7]:+.4f}, {error[8]:+.4f}]\n")
+            self.log_file.write(f"  RL: [{error[9]:+.4f}, {error[10]:+.4f}, {error[11]:+.4f}]\n")
+
+        # Joint velocities
+        self.log_file.write(f"\n[Joint Velocities (SDK order)]\n")
         self.log_file.write(f"  FR: [{dof_vel[0]:+.3f}, {dof_vel[1]:+.3f}, {dof_vel[2]:+.3f}]\n")
         self.log_file.write(f"  FL: [{dof_vel[3]:+.3f}, {dof_vel[4]:+.3f}, {dof_vel[5]:+.3f}]\n")
         self.log_file.write(f"  RR: [{dof_vel[6]:+.3f}, {dof_vel[7]:+.3f}, {dof_vel[8]:+.3f}]\n")
         self.log_file.write(f"  RL: [{dof_vel[9]:+.3f}, {dof_vel[10]:+.3f}, {dof_vel[11]:+.3f}]\n")
 
-        # Foot forces
-        self.log_file.write(f"Foot Forces: FR={foot_force[0]}, FL={foot_force[1]}, RR={foot_force[2]}, RL={foot_force[3]}\n")
+        # Foot forces and contacts
+        self.log_file.write(f"\n[Foot Forces & Contacts]\n")
+        self.log_file.write(f"  Forces: FR={foot_force[0]:.1f}, FL={foot_force[1]:.1f}, RR={foot_force[2]:.1f}, RL={foot_force[3]:.1f}\n")
+        if extra_debug and 'foot_contacts' in extra_debug:
+            fc = extra_debug['foot_contacts']
+            self.log_file.write(f"  Contacts: FR={fc[0]:.0f}, FL={fc[1]:.0f}, RR={fc[2]:.0f}, RL={fc[3]:.0f}\n")
+
+        # Button states
+        remote = state.wireless_remote
+        buttons_raw = remote[2] | (remote[3] << 8)
+        self.log_file.write(f"\n[Buttons]\n")
+        self.log_file.write(f"  raw=0x{buttons_raw:04X}, pressed={self.button_pressed}\n")
 
         # Depth stats
         if depth_stats:
-            self.log_file.write(f"Depth Image: min={depth_stats['min']:.3f}, max={depth_stats['max']:.3f}, mean={depth_stats['mean']:.3f}\n")
+            self.log_file.write(f"\n[Depth Image]\n")
+            self.log_file.write(f"  min={depth_stats['min']:.4f}, max={depth_stats['max']:.4f}, mean={depth_stats['mean']:.4f}\n")
+            self.log_file.write(f"  (Expected range: [-0.5, 0.5])\n")
 
-        # Policy output
-        if policy_output is not None:
-            self.log_file.write(f"Policy Output (target positions, SDK order):\n")
-            self.log_file.write(f"  FR: [{policy_output[0]:+.3f}, {policy_output[1]:+.3f}, {policy_output[2]:+.3f}]\n")
-            self.log_file.write(f"  FL: [{policy_output[3]:+.3f}, {policy_output[4]:+.3f}, {policy_output[5]:+.3f}]\n")
-            self.log_file.write(f"  RR: [{policy_output[6]:+.3f}, {policy_output[7]:+.3f}, {policy_output[8]:+.3f}]\n")
-            self.log_file.write(f"  RL: [{policy_output[9]:+.3f}, {policy_output[10]:+.3f}, {policy_output[11]:+.3f}]\n")
+        # Extra debug info (raw actions, etc.)
+        if extra_debug:
+            if extra_debug.get('last_actions') is not None:
+                actions = extra_debug['last_actions']
+                self.log_file.write(f"\n[Last Actions (Training order, raw from policy)]\n")
+                self.log_file.write(f"  FL: [{actions[0]:+.4f}, {actions[1]:+.4f}, {actions[2]:+.4f}]\n")
+                self.log_file.write(f"  FR: [{actions[3]:+.4f}, {actions[4]:+.4f}, {actions[5]:+.4f}]\n")
+                self.log_file.write(f"  RL: [{actions[6]:+.4f}, {actions[7]:+.4f}, {actions[8]:+.4f}]\n")
+                self.log_file.write(f"  RR: [{actions[9]:+.4f}, {actions[10]:+.4f}, {actions[11]:+.4f}]\n")
 
         self.log_file.write("\n")
         self.log_file.flush()  # Ensure data is written
@@ -633,14 +682,22 @@ class Go2Deployment:
             cmd_vel_x=FIXED_VEL_X,
         )
 
-        # Log sensor data in dryrun mode
-        if self.dryrun:
-            depth_stats = {
-                'min': float(depth.min()),
-                'max': float(depth.max()),
-                'mean': float(depth.mean())
-            }
-            self._log_sensor_data(depth_stats=depth_stats, policy_output=targets)
+        # Log comprehensive data for debugging
+        depth_stats = {
+            'min': float(depth.min()),
+            'max': float(depth.max()),
+            'mean': float(depth.mean())
+        }
+        extra_debug = {
+            'ang_vel': ang_vel.tolist(),
+            'roll': float(roll),
+            'pitch': float(pitch),
+            'dof_pos_sdk': dof_pos.tolist(),
+            'dof_vel_sdk': dof_vel.tolist(),
+            'foot_contacts': foot_contacts.tolist(),
+            'last_actions': self.policy.last_actions.tolist() if self.policy else None,
+        }
+        self._log_sensor_data(depth_stats=depth_stats, policy_output=targets, extra_debug=extra_debug)
 
         return targets
 
