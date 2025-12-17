@@ -38,6 +38,7 @@ from unitree_sdk2py.go2.sport.sport_client import SportClient
 from config import (
     MOTOR_DT, POLICY_DECIMATION,
     KP_WALK, KD_WALK, KP_STAND, KD_STAND,
+    ACTION_SCALE,
     DEFAULT_STAND_ANGLES_SDK, JOINT_POS_MIN, JOINT_POS_MAX,
     STAND_UP_DURATION, SIT_DOWN_DURATION,
     FIXED_VEL_X, SDK_TO_TRAIN_JOINTS,
