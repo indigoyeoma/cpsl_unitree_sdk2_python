@@ -16,8 +16,8 @@ POLICY_DECIMATION = 10     # Run policy every 10 motor ticks (500Hz / 10 = 50Hz)
 # =============================================================================
 KP_WALK = 25.0             # Walking stiffness [N*m/rad]
 KD_WALK = 0.6              # Walking damping [N*m*s/rad]
-KP_STAND = 70.0            # Standing stiffness (higher for stability)
-KD_STAND = 3.0             # Standing damping
+KP_STAND = 60.0            # Standing stiffness (matches Unitree example)
+KD_STAND = 5.0             # Standing damping (matches Unitree example)
 
 # =============================================================================
 # Action Scaling and Clipping (matching training)

@@ -476,22 +476,20 @@ class Go2Deployment:
 
     def _compute_interpolation(self) -> np.ndarray:
         """
-        Compute time-based smooth interpolation (like Unitree example).
-        Smoothly interpolates from start position to target position.
+        Compute time-based linear interpolation (like Unitree example).
+        Linearly interpolates from start position to target position.
 
         Returns:
             Joint position targets in SDK order [12]
         """
-        # Increment progress
+        # Increment progress (same as Unitree: percent += 1.0 / duration_ticks)
         self.interp_progress += MOTOR_DT / self.interp_duration
         self.interp_progress = min(self.interp_progress, 1.0)
 
-        # Smooth ease-in-out interpolation (Hermite smoothstep)
+        # Linear interpolation (exactly like Unitree example)
+        # q = (1 - percent) * startPos + percent * targetPos
         t = self.interp_progress
-        smooth_t = t * t * (3.0 - 2.0 * t)
-
-        # Interpolate: start * (1-t) + target * t
-        target = (1.0 - smooth_t) * self.interp_start_pos + smooth_t * self.interp_target_pos
+        target = (1.0 - t) * self.interp_start_pos + t * self.interp_target_pos
 
         return target
 
@@ -576,7 +574,8 @@ class Go2Deployment:
         self,
         targets: np.ndarray,
         kp: float,
-        kd: float
+        kd: float,
+        skip_torque_limit: bool = False
     ):
         """
         Send motor position commands.
@@ -585,12 +584,14 @@ class Go2Deployment:
             targets: Joint position targets in SDK order [12]
             kp: Position gain
             kd: Damping gain
+            skip_torque_limit: Skip torque limiting (for smooth interpolation states)
         """
         # Clip to joint limits
         targets = np.clip(targets, JOINT_POS_MIN, JOINT_POS_MAX)
 
-        # Clip by torque limits (parkour safety pattern)
-        targets = self._clip_by_torque_limit(targets, kp, kd)
+        # Clip by torque limits (only during walking, not during stand/sit interpolation)
+        if not skip_torque_limit:
+            targets = self._clip_by_torque_limit(targets, kp, kd)
 
         for i in range(12):
             self.low_cmd.motor_cmd[i].mode = 0x01
@@ -649,15 +650,16 @@ class Go2Deployment:
 
         elif self.state == State.STANDING_UP:
             # Time-based smooth interpolation (like Unitree example)
+            # Skip torque limiting - interpolation ensures smooth motion
             self.current_target = self._compute_interpolation()
-            self._send_motor_commands(self.current_target, KP_STAND, KD_STAND)
+            self._send_motor_commands(self.current_target, KP_STAND, KD_STAND, skip_torque_limit=True)
 
             # Check if interpolation complete
             if self._is_interpolation_complete():
                 self._enter_state(State.STANDING)
 
         elif self.state == State.STANDING:
-            # Hold at stand position
+            # Hold at stand position (with torque limiting for safety)
             self._send_motor_commands(DEFAULT_STAND_ANGLES_SDK, KP_STAND, KD_STAND)
 
             # L1 to start walking (like parkour)
@@ -673,6 +675,7 @@ class Go2Deployment:
                 self.policy_tick += 1
                 self.current_target = self._run_policy()
 
+            # Keep torque limiting during walking for safety
             self._send_motor_commands(self.current_target, KP_WALK, KD_WALK)
 
             # Y to reset policy and return to standing
@@ -683,8 +686,9 @@ class Go2Deployment:
 
         elif self.state == State.SITTING_DOWN:
             # Time-based smooth interpolation to sit pose
+            # Skip torque limiting - interpolation ensures smooth motion
             self.current_target = self._compute_interpolation()
-            self._send_motor_commands(self.current_target, KP_STAND, KD_STAND)
+            self._send_motor_commands(self.current_target, KP_STAND, KD_STAND, skip_torque_limit=True)
 
             # Check if interpolation complete
             if self._is_interpolation_complete():
