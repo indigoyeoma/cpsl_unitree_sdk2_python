@@ -3,7 +3,7 @@
 Go2 Vision Policy Deployment Script
 
 Controls:
-    Y:  Stand up (from IDLE) / Reset policy (when walking)
+    Y:  Stand up (from IDLE) / Sit down (from STANDING) / Reset policy (from WALKING)
     L1: Enable walking policy (when standing)
     R2/L2: EMERGENCY STOP - cuts all motor power
 
@@ -60,7 +60,18 @@ class State(IntEnum):
     STANDING_UP = 1    # Interpolating to stand pose
     STANDING = 2       # Holding stand pose
     WALKING = 3        # Running vision policy
-    EMERGENCY = 4      # Emergency stop - motors off
+    SITTING_DOWN = 4   # Interpolating to sit pose
+    EMERGENCY = 5      # Emergency stop - motors off
+
+
+# Sitting pose (crouched, low to ground) - SDK order
+# Based on Unitree example targetPos_1
+SIT_ANGLES_SDK = np.array([
+    0.0, 1.36, -2.65,    # FR: hip, thigh, calf (folded)
+    0.0, 1.36, -2.65,    # FL
+    -0.2, 1.36, -2.65,   # RR (slight hip offset)
+    0.2, 1.36, -2.65,    # RL
+], dtype=np.float32)
 
 
 class Go2Deployment:
@@ -97,9 +108,11 @@ class Go2Deployment:
         self.target_pos = DEFAULT_STAND_ANGLES_SDK.copy()
         self.current_target = DEFAULT_STAND_ANGLES_SDK.copy()
 
-        # Gradual standing parameters (matches parkour's ZeroActModel)
-        self.stand_delta = 0.2  # Step size toward target
-        self.stand_tolerance = 0.15  # Close enough threshold
+        # Standing/sitting interpolation (time-based like Unitree example)
+        self.interp_start_pos = np.zeros(12, dtype=np.float32)
+        self.interp_target_pos = np.zeros(12, dtype=np.float32)
+        self.interp_progress = 0.0
+        self.interp_duration = STAND_UP_DURATION  # Will be set per state
 
         # Components
         self.camera: Optional[DepthCamera] = None
@@ -226,12 +239,17 @@ class Go2Deployment:
         print("=" * 60)
         print("Initialization complete!")
         print()
-        print("Controls (matching parkour):")
-        print("  Y:  Stand up (from IDLE) / Reset policy (when walking)")
+        print("Controls:")
+        print("  Y:  Stand (from IDLE) / Sit (from STANDING) / Reset (from WALKING)")
         print("  L1: Enable walking policy (when standing)")
         print("  R2/L2: EMERGENCY STOP")
         print()
-        print("State flow: IDLE --(Y)--> STANDING --(L1)--> WALKING --(Y)--> STANDING")
+        print("State flow:")
+        print("  IDLE --(Y)--> STANDING_UP --> STANDING --(L1)--> WALKING")
+        print("                                    |                  |")
+        print("                                   (Y)                (Y)")
+        print("                                    v                  v")
+        print("  IDLE <-- SITTING_DOWN <--------- + <---- (reset) ---+")
         print("=" * 60)
         print()
 
@@ -444,42 +462,42 @@ class Go2Deployment:
         remote = self.low_state.wireless_remote
         return remote[2] | (remote[3] << 8)
 
-    def _compute_gradual_stand_action(self) -> np.ndarray:
+    def _init_interpolation(self, target_pos: np.ndarray, duration: float):
+        """Initialize position interpolation from current position to target."""
+        if self.low_state is not None:
+            self.interp_start_pos = np.array([
+                self.low_state.motor_state[i].q for i in range(12)
+            ], dtype=np.float32)
+        else:
+            self.interp_start_pos = DEFAULT_STAND_ANGLES_SDK.copy()
+        self.interp_target_pos = target_pos.copy()
+        self.interp_duration = duration
+        self.interp_progress = 0.0
+
+    def _compute_interpolation(self) -> np.ndarray:
         """
-        Compute gradual standing action like parkour's ZeroActModel.
-        Moves joints toward DEFAULT_STAND_ANGLES_SDK with controlled delta.
+        Compute time-based smooth interpolation (like Unitree example).
+        Smoothly interpolates from start position to target position.
 
         Returns:
             Joint position targets in SDK order [12]
         """
-        if self.low_state is None:
-            return DEFAULT_STAND_ANGLES_SDK.copy()
+        # Increment progress
+        self.interp_progress += MOTOR_DT / self.interp_duration
+        self.interp_progress = min(self.interp_progress, 1.0)
 
-        # Get current joint positions
-        dof_pos = np.array([
-            self.low_state.motor_state[i].q for i in range(12)
-        ], dtype=np.float32)
+        # Smooth ease-in-out interpolation (Hermite smoothstep)
+        t = self.interp_progress
+        smooth_t = t * t * (3.0 - 2.0 * t)
 
-        target = DEFAULT_STAND_ANGLES_SDK.copy()
-        diff = dof_pos - target
-
-        # For joints far from target, move by delta toward target
-        diff_large_mask = np.abs(diff) > self.stand_tolerance
-        target[diff_large_mask] = dof_pos[diff_large_mask] - self.stand_delta * np.sign(diff[diff_large_mask])
+        # Interpolate: start * (1-t) + target * t
+        target = (1.0 - smooth_t) * self.interp_start_pos + smooth_t * self.interp_target_pos
 
         return target
 
-    def _is_at_stand_position(self) -> bool:
-        """Check if robot is at stand position (all joints within tolerance)."""
-        if self.low_state is None:
-            return False
-
-        dof_pos = np.array([
-            self.low_state.motor_state[i].q for i in range(12)
-        ], dtype=np.float32)
-
-        diff = np.abs(dof_pos - DEFAULT_STAND_ANGLES_SDK)
-        return np.all(diff <= self.stand_tolerance)
+    def _is_interpolation_complete(self) -> bool:
+        """Check if interpolation is complete."""
+        return self.interp_progress >= 1.0
 
     def _enter_state(self, new_state: State):
         """Transition to a new state."""
@@ -489,16 +507,17 @@ class Go2Deployment:
 
         # State entry actions
         if new_state == State.STANDING_UP:
-            # Record current position for interpolation
-            if self.low_state is not None:
-                self.start_pos = np.array([
-                    self.low_state.motor_state[i].q for i in range(12)
-                ], dtype=np.float32)
-            self.target_pos = DEFAULT_STAND_ANGLES_SDK.copy()
+            # Initialize time-based interpolation to stand pose
+            self._init_interpolation(DEFAULT_STAND_ANGLES_SDK, STAND_UP_DURATION)
             print("STATE: Standing up...")
 
         elif new_state == State.STANDING:
-            print("STATE: Standing - press L1 to start walking")
+            print("STATE: Standing - press L1 to walk, Y to sit")
+
+        elif new_state == State.SITTING_DOWN:
+            # Initialize time-based interpolation to sit pose
+            self._init_interpolation(SIT_ANGLES_SDK, SIT_DOWN_DURATION)
+            print("STATE: Sitting down...")
 
         elif new_state == State.WALKING:
             self.policy.reset()
@@ -629,23 +648,24 @@ class Go2Deployment:
                 self._enter_state(State.STANDING_UP)
 
         elif self.state == State.STANDING_UP:
-            # Gradual standing like parkour's ZeroActModel
-            self.current_target = self._compute_gradual_stand_action()
+            # Time-based smooth interpolation (like Unitree example)
+            self.current_target = self._compute_interpolation()
             self._send_motor_commands(self.current_target, KP_STAND, KD_STAND)
 
-            # Check if at stand position
-            if self._is_at_stand_position():
-                print("  Standing complete - press L1 to start walking")
+            # Check if interpolation complete
+            if self._is_interpolation_complete():
                 self._enter_state(State.STANDING)
 
         elif self.state == State.STANDING:
-            # Hold at stand position with gradual correction
-            self.current_target = self._compute_gradual_stand_action()
-            self._send_motor_commands(self.current_target, KP_STAND, KD_STAND)
+            # Hold at stand position
+            self._send_motor_commands(DEFAULT_STAND_ANGLES_SDK, KP_STAND, KD_STAND)
 
             # L1 to start walking (like parkour)
             if buttons & self.WirelessButtons.L1:
                 self._enter_state(State.WALKING)
+            # Y to sit down
+            elif buttons & self.WirelessButtons.Y:
+                self._enter_state(State.SITTING_DOWN)
 
         elif self.state == State.WALKING:
             # Run policy at 50Hz
@@ -655,11 +675,20 @@ class Go2Deployment:
 
             self._send_motor_commands(self.current_target, KP_WALK, KD_WALK)
 
-            # Y to reset policy (like parkour) - goes back to standing
+            # Y to reset policy and return to standing
             if buttons & self.WirelessButtons.Y:
                 self.policy.reset()
                 print("  Policy reset - returning to stand")
                 self._enter_state(State.STANDING)
+
+        elif self.state == State.SITTING_DOWN:
+            # Time-based smooth interpolation to sit pose
+            self.current_target = self._compute_interpolation()
+            self._send_motor_commands(self.current_target, KP_STAND, KD_STAND)
+
+            # Check if interpolation complete
+            if self._is_interpolation_complete():
+                self._enter_state(State.IDLE)
 
         elif self.state == State.EMERGENCY:
             self._send_emergency_stop()
