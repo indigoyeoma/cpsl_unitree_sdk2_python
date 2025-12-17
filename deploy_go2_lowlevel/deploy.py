@@ -9,8 +9,10 @@ Controls:
 
 Usage:
     python deploy.py                    # Normal mode
-    python deploy.py --dryrun           # Test without motor commands
+    python deploy.py --dryrun           # Test without motor commands (saves logs)
     python deploy.py --no-camera        # Test without depth camera
+
+Dryrun mode saves sensor logs to: deploy_log_YYYYMMDD_HHMMSS.txt
 """
 import sys
 import os
@@ -20,6 +22,7 @@ import argparse
 import numpy as np
 from enum import IntEnum
 from typing import Optional
+from datetime import datetime
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -106,6 +109,11 @@ class Go2Deployment:
         # Thread control
         self.running = False
         self.control_thread = None
+
+        # Logging (for dryrun mode)
+        self.log_file = None
+        self.log_entries = []
+        self.log_start_time = time.time()
 
     def init_low_cmd(self):
         """Initialize the low-level command structure."""
@@ -220,7 +228,100 @@ class Go2Deployment:
         print("=" * 60)
         print()
 
+        # Initialize logging for dryrun mode
+        if self.dryrun:
+            self._init_logging()
+
         return True
+
+    def _init_logging(self):
+        """Initialize log file for dryrun mode."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"deploy_log_{timestamp}.txt"
+        log_path = os.path.join(os.path.dirname(__file__), log_filename)
+
+        self.log_file = open(log_path, 'w')
+        self.log_start_time = time.time()
+
+        # Write header
+        self.log_file.write("=" * 80 + "\n")
+        self.log_file.write(f"Go2 Deployment Log - DRYRUN MODE\n")
+        self.log_file.write(f"Started: {datetime.now().isoformat()}\n")
+        self.log_file.write("=" * 80 + "\n\n")
+
+        # Write configuration
+        self.log_file.write("## Configuration\n")
+        self.log_file.write(f"- Camera enabled: {not self.no_camera}\n")
+        self.log_file.write(f"- Fixed velocity: {FIXED_VEL_X} m/s\n")
+        self.log_file.write(f"- KP_WALK: {KP_WALK}, KD_WALK: {KD_WALK}\n")
+        self.log_file.write(f"- ACTION_SCALE: {ACTION_SCALE}\n")
+        self.log_file.write("\n")
+
+        print(f"Logging to: {log_path}")
+
+    def _log_sensor_data(self, depth_stats: dict = None, policy_output: np.ndarray = None):
+        """Log sensor data to file."""
+        if self.log_file is None or self.low_state is None:
+            return
+
+        t = time.time() - self.log_start_time
+        state = self.low_state
+
+        # Get sensor data
+        ang_vel = np.array([state.imu_state.gyroscope[i] for i in range(3)])
+        rpy = np.array([state.imu_state.rpy[i] for i in range(3)])
+        dof_pos = np.array([state.motor_state[i].q for i in range(12)])
+        dof_vel = np.array([state.motor_state[i].dq for i in range(12)])
+        foot_force = np.array([state.foot_force[i] for i in range(4)])
+
+        # Write log entry
+        self.log_file.write(f"--- Tick {self.policy_tick} | t={t:.3f}s | State: {self.state.name} ---\n")
+
+        # IMU
+        self.log_file.write(f"IMU:\n")
+        self.log_file.write(f"  roll={rpy[0]:+.4f}, pitch={rpy[1]:+.4f}, yaw={rpy[2]:+.4f}\n")
+        self.log_file.write(f"  ang_vel=[{ang_vel[0]:+.4f}, {ang_vel[1]:+.4f}, {ang_vel[2]:+.4f}]\n")
+
+        # Joints (SDK order: FR, FL, RR, RL)
+        self.log_file.write(f"Joint Positions (SDK order):\n")
+        self.log_file.write(f"  FR: [{dof_pos[0]:+.3f}, {dof_pos[1]:+.3f}, {dof_pos[2]:+.3f}]\n")
+        self.log_file.write(f"  FL: [{dof_pos[3]:+.3f}, {dof_pos[4]:+.3f}, {dof_pos[5]:+.3f}]\n")
+        self.log_file.write(f"  RR: [{dof_pos[6]:+.3f}, {dof_pos[7]:+.3f}, {dof_pos[8]:+.3f}]\n")
+        self.log_file.write(f"  RL: [{dof_pos[9]:+.3f}, {dof_pos[10]:+.3f}, {dof_pos[11]:+.3f}]\n")
+
+        self.log_file.write(f"Joint Velocities (SDK order):\n")
+        self.log_file.write(f"  FR: [{dof_vel[0]:+.3f}, {dof_vel[1]:+.3f}, {dof_vel[2]:+.3f}]\n")
+        self.log_file.write(f"  FL: [{dof_vel[3]:+.3f}, {dof_vel[4]:+.3f}, {dof_vel[5]:+.3f}]\n")
+        self.log_file.write(f"  RR: [{dof_vel[6]:+.3f}, {dof_vel[7]:+.3f}, {dof_vel[8]:+.3f}]\n")
+        self.log_file.write(f"  RL: [{dof_vel[9]:+.3f}, {dof_vel[10]:+.3f}, {dof_vel[11]:+.3f}]\n")
+
+        # Foot forces
+        self.log_file.write(f"Foot Forces: FR={foot_force[0]}, FL={foot_force[1]}, RR={foot_force[2]}, RL={foot_force[3]}\n")
+
+        # Depth stats
+        if depth_stats:
+            self.log_file.write(f"Depth Image: min={depth_stats['min']:.3f}, max={depth_stats['max']:.3f}, mean={depth_stats['mean']:.3f}\n")
+
+        # Policy output
+        if policy_output is not None:
+            self.log_file.write(f"Policy Output (target positions, SDK order):\n")
+            self.log_file.write(f"  FR: [{policy_output[0]:+.3f}, {policy_output[1]:+.3f}, {policy_output[2]:+.3f}]\n")
+            self.log_file.write(f"  FL: [{policy_output[3]:+.3f}, {policy_output[4]:+.3f}, {policy_output[5]:+.3f}]\n")
+            self.log_file.write(f"  RR: [{policy_output[6]:+.3f}, {policy_output[7]:+.3f}, {policy_output[8]:+.3f}]\n")
+            self.log_file.write(f"  RL: [{policy_output[9]:+.3f}, {policy_output[10]:+.3f}, {policy_output[11]:+.3f}]\n")
+
+        self.log_file.write("\n")
+        self.log_file.flush()  # Ensure data is written
+
+    def _close_logging(self):
+        """Close the log file."""
+        if self.log_file is not None:
+            self.log_file.write("=" * 80 + "\n")
+            self.log_file.write(f"Log ended: {datetime.now().isoformat()}\n")
+            self.log_file.write(f"Total policy ticks: {self.policy_tick}\n")
+            self.log_file.write("=" * 80 + "\n")
+            self.log_file.close()
+            print(f"Log saved with {self.policy_tick} entries")
 
     def _verify_joint_mapping(self) -> bool:
         """
@@ -495,6 +596,15 @@ class Go2Deployment:
             cmd_vel_x=FIXED_VEL_X,
         )
 
+        # Log sensor data in dryrun mode
+        if self.dryrun:
+            depth_stats = {
+                'min': float(depth.min()),
+                'max': float(depth.max()),
+                'mean': float(depth.mean())
+            }
+            self._log_sensor_data(depth_stats=depth_stats, policy_output=targets)
+
         return targets
 
     def start(self):
@@ -518,6 +628,9 @@ class Go2Deployment:
 
         if self.camera is not None:
             self.camera.stop()
+
+        # Close log file
+        self._close_logging()
 
         print("Stopped")
 
