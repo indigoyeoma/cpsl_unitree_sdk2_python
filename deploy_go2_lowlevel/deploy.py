@@ -115,6 +115,9 @@ class Go2Deployment:
         self.interp_percent = 0.0
         self.interp_duration_ticks = 500  # 500 ticks @ 500Hz = 1 second
 
+        # Button state for edge detection (print only on press)
+        self._last_buttons = 0
+
         # Components
         self.camera: Optional[DepthCamera] = None
         self.policy: Optional[PolicyRunner] = None
@@ -636,6 +639,23 @@ class Go2Deployment:
 
         # Get button bitmask (simple bitwise like parkour)
         buttons = self._get_buttons()
+
+        # Print button presses for convenience (only on rising edge)
+        new_presses = buttons & ~self._last_buttons
+        if new_presses:
+            if new_presses & self.WirelessButtons.Y:
+                print("  [Button] Y pressed")
+            if new_presses & self.WirelessButtons.L1:
+                print("  [Button] L1 pressed")
+            if new_presses & self.WirelessButtons.R2:
+                print("  [Button] R2 pressed")
+            if new_presses & self.WirelessButtons.L2:
+                print("  [Button] L2 pressed")
+            if new_presses & self.WirelessButtons.A:
+                print("  [Button] A pressed")
+            if new_presses & self.WirelessButtons.B:
+                print("  [Button] B pressed")
+        self._last_buttons = buttons
 
         # Emergency stop takes priority - LATCHING (R2 or L2)
         if (buttons & self.WirelessButtons.R2) or (buttons & self.WirelessButtons.L2) or self.state == State.EMERGENCY:
