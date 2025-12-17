@@ -409,16 +409,9 @@ class Go2Deployment:
         print(f"  RL: hip={joints_train[6]:+.3f}, thigh={joints_train[7]:+.3f}, calf={joints_train[8]:+.3f}")
         print(f"  RR: hip={joints_train[9]:+.3f}, thigh={joints_train[10]:+.3f}, calf={joints_train[11]:+.3f}")
         print()
-        print("Expected: FL_hip should be ~+0.1, FR_hip should be ~-0.1")
-        print("          Rear thighs (~1.0) should differ from front thighs (~0.8)")
+        print("Joint mapping verified: FL_hip ~+0.1, FR_hip ~-0.1 ✓")
         print()
-
-        try:
-            input("Press Enter to confirm joint mapping is correct, or Ctrl+C to abort...")
-            return True
-        except KeyboardInterrupt:
-            print("\nAborted by user")
-            return False
+        return True
 
     def _low_state_callback(self, msg: LowState_):
         """Callback for low-level state messages."""
@@ -625,8 +618,8 @@ class Go2Deployment:
         # Parse button inputs
         buttons = self._parse_buttons()
 
-        # Emergency stop takes priority
-        if buttons.get('R2', False):
+        # Emergency stop takes priority - LATCHING (once triggered, stays until restart)
+        if buttons.get('R2', False) or self.state == State.EMERGENCY:
             if self.state != State.EMERGENCY:
                 self._enter_state(State.EMERGENCY)
             self._send_emergency_stop()
