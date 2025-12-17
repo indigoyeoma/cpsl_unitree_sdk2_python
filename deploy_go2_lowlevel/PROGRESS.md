@@ -274,3 +274,102 @@ Index 12:    env_class_flag_2
 2. Depth encoder sees terrain and predicts yaw correction needed
 3. If robot turns right, encoder should predict left correction (positive delta_yaw)
 4. Policy uses yaw prediction to adjust leg movements for steering
+
+---
+
+## Goal-Based Navigation Fix (Added 2025-12-17)
+
+### Problem: Depth Encoder Outputs Wrong Yaw on Flat Ground
+
+Even after implementing yaw prediction, robot kept drifting right.
+
+**Root Cause**: The depth encoder was trained with explicit goal waypoints:
+```python
+# Training code computes:
+delta_yaw = target_yaw - current_yaw  # direction to goal waypoint
+```
+
+On flat ground with no visual features, the encoder has no "goal" to navigate toward,
+so it outputs its learned bias (which happened to be negative = turn right).
+
+### Solution: Fixed Goal Direction
+
+Instead of using depth encoder's yaw prediction, set a fixed goal direction:
+
+```python
+# In depth_encoder_process.py:
+USE_DEPTH_ENCODER_YAW = False  # Disable encoder yaw prediction
+
+# Fixed goal (meters relative to robot)
+GOAL_X = 10.0   # ahead
+GOAL_Y = 0.0    # side (+ left, - right)
+
+# Compute delta_yaw to goal
+delta_yaw = math.atan2(GOAL_Y, GOAL_X) + DRIFT_CORRECTION
+```
+
+### Hardware Drift Correction
+
+Even with fixed goal, robot had inherent rightward drift (hardware/policy bias).
+Added constant correction:
+
+```python
+DRIFT_CORRECTION = 0.23  # Tuned value (positive = turn left)
+```
+
+**Tuning process:**
+| Value | Result |
+|-------|--------|
+| 0.0   | Drifted right ~52° |
+| 0.15  | Drifted right ~54° |
+| 0.35  | Drifted left ~48° |
+| 0.23  | Approximately straight |
+
+### Configuration Options
+
+```python
+# depth_encoder_process.py settings:
+
+USE_DEPTH_ENCODER_YAW = False  # True for terrain with obstacles
+GOAL_X = 10.0                  # meters ahead
+GOAL_Y = 0.0                   # meters to side (+ left, - right)
+DRIFT_CORRECTION = 0.23        # hardware drift compensation
+```
+
+### Goal Examples
+
+| Scenario | GOAL_X | GOAL_Y | delta_yaw |
+|----------|--------|--------|-----------|
+| Straight ahead | 10.0 | 0.0 | 0° |
+| Slight left | 10.0 | 2.0 | ~11° |
+| Hard left | 10.0 | 10.0 | ~45° |
+| Slight right | 10.0 | -2.0 | ~-11° |
+
+### When to Use Each Mode
+
+| Mode | Setting | Use Case |
+|------|---------|----------|
+| Fixed goal | `USE_DEPTH_ENCODER_YAW = False` | Flat ground, walk straight |
+| Depth encoder | `USE_DEPTH_ENCODER_YAW = True` | Terrain with obstacles/features |
+
+### Key Insight
+
+The depth encoder predicts yaw corrections based on **visual features**.
+Without features (flat ground), it outputs meaningless values.
+For flat ground testing, use fixed goal direction instead.
+
+---
+
+## Vibration Fix (Added 2025-12-17)
+
+### Problem: Robot Vibrating During Walking
+
+### Solution: Increased Damping
+
+```python
+# config.py
+KD_WALK = 1.0  # Increased from 0.6
+```
+
+Original ratio KP/KD = 25/0.6 = 41.7 (too high, causes oscillation)
+New ratio KP/KD = 25/1.0 = 25 (more stable)
