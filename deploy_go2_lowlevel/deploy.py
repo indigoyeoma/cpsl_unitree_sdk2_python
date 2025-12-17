@@ -43,7 +43,8 @@ from config import (
     STAND_UP_DURATION, SIT_DOWN_DURATION,
     FIXED_VEL_X, SDK_TO_TRAIN_JOINTS,
     DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH,
-    DEPTH_NEAR, DEPTH_FAR
+    DEPTH_NEAR, DEPTH_FAR,
+    TORQUE_LIMITS
 )
 from depth_camera import DepthCamera
 from policy_runner import PolicyRunner
@@ -529,6 +530,43 @@ class Go2Deployment:
         """Get time spent in current state."""
         return time.time() - self.state_start_time
 
+    def _clip_by_torque_limit(
+        self,
+        targets: np.ndarray,
+        kp: float,
+        kd: float
+    ) -> np.ndarray:
+        """
+        Clip position targets to ensure torques stay within limits.
+
+        This matches parkour's clip_by_torque_limit - prevents excessive
+        torque by limiting how far the target can be from current position.
+
+        Args:
+            targets: Joint position targets in SDK order [12]
+            kp: Position gain
+            kd: Damping gain
+
+        Returns:
+            Clipped targets [12]
+        """
+        if self.low_state is None:
+            return targets
+
+        # Get current joint state
+        dof_pos = np.array([self.low_state.motor_state[i].q for i in range(12)], dtype=np.float32)
+        dof_vel = np.array([self.low_state.motor_state[i].dq for i in range(12)], dtype=np.float32)
+
+        # Torque = kp * (target - pos) - kd * vel
+        # Max torque when: kp * (target - pos) = torque_limit + kd * vel
+        # So: target_max = pos + (torque_limit + kd * vel) / kp
+        #     target_min = pos + (-torque_limit + kd * vel) / kp
+
+        targets_high = dof_pos + (TORQUE_LIMITS + kd * dof_vel) / kp
+        targets_low = dof_pos + (-TORQUE_LIMITS + kd * dof_vel) / kp
+
+        return np.clip(targets, targets_low, targets_high)
+
     def _send_motor_commands(
         self,
         targets: np.ndarray,
@@ -545,6 +583,9 @@ class Go2Deployment:
         """
         # Clip to joint limits
         targets = np.clip(targets, JOINT_POS_MIN, JOINT_POS_MAX)
+
+        # Clip by torque limits (parkour safety pattern)
+        targets = self._clip_by_torque_limit(targets, kp, kd)
 
         for i in range(12):
             self.low_cmd.motor_cmd[i].mode = 0x01
@@ -670,8 +711,8 @@ class Go2Deployment:
             1.0 if state.foot_force[i] > 20 else 0.0 for i in range(4)
         ], dtype=np.float32)
 
-        # Run inference
-        targets = self.policy.run_inference(
+        # Run inference (returns targets and raw_actions for logging)
+        targets, raw_actions = self.policy.run_inference(
             depth_image=depth,
             ang_vel=ang_vel,
             roll=roll,
@@ -696,6 +737,7 @@ class Go2Deployment:
             'dof_vel_sdk': dof_vel.tolist(),
             'foot_contacts': foot_contacts.tolist(),
             'last_actions': self.policy.last_actions.tolist() if self.policy else None,
+            'raw_actions': raw_actions.tolist(),  # Raw unclipped actions for debugging
         }
         self._log_sensor_data(depth_stats=depth_stats, policy_output=targets, extra_debug=extra_debug)
 

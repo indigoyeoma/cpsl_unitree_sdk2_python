@@ -20,9 +20,11 @@ KP_STAND = 70.0            # Standing stiffness (higher for stability)
 KD_STAND = 3.0             # Standing damping
 
 # =============================================================================
-# Action Scaling
+# Action Scaling and Clipping (matching training)
 # =============================================================================
 ACTION_SCALE = 0.25        # Policy output scale
+CLIP_ACTIONS = 1.2         # Raw action clipping value from training
+# Effective clip range: CLIP_ACTIONS / ACTION_SCALE = 1.2 / 0.25 = 4.8
 
 # =============================================================================
 # Observation Dimensions

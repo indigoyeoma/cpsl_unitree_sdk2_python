@@ -14,7 +14,7 @@ from config import (
     N_PROPRIO, N_SCAN, N_PRIV_EXPLICIT, N_PRIV_LATENT, HISTORY_LEN, N_OBS,
     DEPTH_LATENT_DIM, DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH,
     SDK_TO_TRAIN_JOINTS, TRAIN_TO_SDK_JOINTS, SDK_TO_TRAIN_FEET,
-    DEFAULT_STAND_ANGLES_TRAIN, ACTION_SCALE,
+    DEFAULT_STAND_ANGLES_TRAIN, ACTION_SCALE, CLIP_ACTIONS,
     ObsScales
 )
 
@@ -211,21 +211,23 @@ class PolicyRunner:
         dof_pos_normalized = (dof_pos_train - DEFAULT_STAND_ANGLES_TRAIN) * ObsScales.dof_pos
         dof_vel_scaled = dof_vel_train * ObsScales.dof_vel
 
-        # Build observation vector (matching training order)
+        # Build observation vector (matching training order exactly)
+        # Training code: self.reindex_feet(self.contact_filt.float()-0.5)
+        # Range: [-0.5, 0.5] where -0.5=no contact, +0.5=contact
         proprio = np.concatenate([
             ang_vel_scaled,                      # [3] base angular velocity
             np.array([roll, pitch]),             # [2] orientation
-            np.array([0.0]),                     # [1] delta_yaw (masked)
-            np.array([0.0]),                     # [1] delta_yaw (actual - using 0)
+            np.array([0.0]),                     # [1] delta_yaw (masked with 0*)
+            np.array([0.0]),                     # [1] delta_yaw (actual - using 0 since we don't track heading)
             np.array([0.0]),                     # [1] delta_next_yaw
-            np.array([0.0, 0.0]),                # [2] commands (masked)
-            np.array([cmd_vel_x]),               # [1] forward velocity command
-            np.array([1.0]),                     # [1] env_class != 17
+            np.array([0.0, 0.0]),                # [2] commands (masked with 0*)
+            np.array([cmd_vel_x]),               # [1] forward velocity command (commands[:, 0:1])
+            np.array([1.0]),                     # [1] env_class != 17 (assume normal terrain)
             np.array([0.0]),                     # [1] env_class == 17
             dof_pos_normalized,                  # [12] joint positions
             dof_vel_scaled,                      # [12] joint velocities
             last_actions_train,                  # [12] last actions
-            contacts_train - 0.5,                # [4] contact states (centered)
+            contacts_train - 0.5,                # [4] contact states, range [-0.5, 0.5]
         ]).astype(np.float32)
 
         return proprio
@@ -240,30 +242,33 @@ class PolicyRunner:
         Returns:
             Full observation [N_OBS]
         """
-        # Initialize history if needed
+        # Initialize history if needed (fill with current proprio, matching training reset)
         if self.obs_history is None:
-            self.obs_history = np.tile(proprio, (HISTORY_LEN, 1))
+            proprio_masked = proprio.copy()
+            proprio_masked[6:8] = 0.0  # Mask yaw
+            self.obs_history = np.tile(proprio_masked, (HISTORY_LEN, 1))
 
-        # Mask yaw in history (indices 6:8)
-        proprio_for_history = proprio.copy()
-        proprio_for_history[6:8] = 0.0
-
-        # Update history buffer (FIFO)
-        self.obs_history = np.roll(self.obs_history, -1, axis=0)
-        self.obs_history[-1] = proprio_for_history
-
-        # Build full observation
+        # Build full observation FIRST (using history from previous steps)
+        # This matches training: obs is built, THEN history is updated
         scan = np.zeros(N_SCAN, dtype=np.float32)  # Placeholder (replaced by depth latent)
         priv_explicit = np.zeros(N_PRIV_EXPLICIT, dtype=np.float32)  # Estimated by network
         priv_latent = np.zeros(N_PRIV_LATENT, dtype=np.float32)  # Placeholder
 
         obs = np.concatenate([
-            proprio,                           # [53]
+            proprio,                           # [53] current proprio
             scan,                              # [132]
             priv_explicit,                     # [9]
             priv_latent,                       # [29]
-            self.obs_history.flatten(),        # [530]
+            self.obs_history.flatten(),        # [530] history from PREVIOUS steps
         ]).astype(np.float32)
+
+        # THEN update history buffer (FIFO) for next step
+        # Mask yaw in history (indices 6:8) - matching training
+        proprio_for_history = proprio.copy()
+        proprio_for_history[6:8] = 0.0
+
+        self.obs_history = np.roll(self.obs_history, -1, axis=0)
+        self.obs_history[-1] = proprio_for_history
 
         return obs
 
@@ -298,7 +303,7 @@ class PolicyRunner:
         self,
         obs: np.ndarray,
         depth_latent: np.ndarray
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get action from the base policy.
 
@@ -307,26 +312,30 @@ class PolicyRunner:
             depth_latent: Depth encoder output [32]
 
         Returns:
-            Joint position targets in SDK order [12]
+            Tuple of (joint position targets in SDK order [12], raw actions for logging [12])
         """
         # Convert to tensors
         obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
         depth_tensor = torch.from_numpy(depth_latent).float().unsqueeze(0).to(self.device)
 
         # Run policy
-        actions_train = self.base_policy(obs_tensor, depth_tensor)
-        actions_train = actions_train[0].cpu().numpy()
+        actions_raw = self.base_policy(obs_tensor, depth_tensor)
+        actions_raw = actions_raw[0].cpu().numpy()
 
-        # Store for next step
-        self.last_actions = actions_train.copy()
+        # Clip actions before scaling (matching parkour's clip_action_before_scale)
+        # CLIP_ACTIONS = 1.2, so effective range is [-1.2, 1.2]
+        actions_clipped = np.clip(actions_raw, -CLIP_ACTIONS, CLIP_ACTIONS)
 
-        # Convert to joint targets
-        targets_train = actions_train * ACTION_SCALE + DEFAULT_STAND_ANGLES_TRAIN
+        # Store clipped actions for next step (used in observations)
+        self.last_actions = actions_clipped.copy()
+
+        # Convert to joint targets: action * scale + default_pos
+        targets_train = actions_clipped * ACTION_SCALE + DEFAULT_STAND_ANGLES_TRAIN
 
         # Reindex to SDK order
         targets_sdk = self.reindex_joints_to_sdk(targets_train)
 
-        return targets_sdk
+        return targets_sdk, actions_raw
 
     def run_inference(
         self,
@@ -338,7 +347,7 @@ class PolicyRunner:
         dof_vel: np.ndarray,
         foot_contacts: np.ndarray,
         cmd_vel_x: float = 0.5,
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Run full inference pipeline.
 
@@ -351,7 +360,7 @@ class PolicyRunner:
             cmd_vel_x: Forward velocity command
 
         Returns:
-            Joint position targets in SDK order [12]
+            Tuple of (joint position targets in SDK order [12], raw actions for logging [12])
         """
         # Build proprioceptive observation
         proprio = self.build_proprio_obs(
@@ -364,10 +373,10 @@ class PolicyRunner:
         # Get depth latent
         depth_latent = self.get_depth_latent(depth_image, proprio)
 
-        # Get action
-        targets = self.get_action(obs, depth_latent)
+        # Get action (returns tuple of targets and raw actions)
+        targets, raw_actions = self.get_action(obs, depth_latent)
 
-        return targets
+        return targets, raw_actions
 
 
 def test_policy():
@@ -381,6 +390,7 @@ def test_policy():
         return
 
     print("\nRunning inference with dummy inputs...")
+    print(f"Action clipping enabled: raw actions clipped to [-{CLIP_ACTIONS}, {CLIP_ACTIONS}]")
 
     # Create dummy inputs
     depth_image = np.random.rand(DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH).astype(np.float32)
@@ -392,10 +402,12 @@ def test_policy():
 
     # Run inference
     for i in range(5):
-        targets = runner.run_inference(
+        targets, raw_actions = runner.run_inference(
             depth_image, ang_vel, roll, pitch, dof_pos, dof_vel, foot_contacts
         )
-        print(f"Step {i+1}: targets = {targets}")
+        print(f"Step {i+1}:")
+        print(f"  Raw actions: min={raw_actions.min():.3f}, max={raw_actions.max():.3f}")
+        print(f"  Targets: {targets}")
 
     print("\nTest complete")
 
