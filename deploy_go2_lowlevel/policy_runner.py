@@ -200,11 +200,15 @@ class PolicyRunner:
         Returns:
             Proprio observation [N_PROPRIO] in training convention
         """
-        # Reindex to training order
+        # Reindex to training order (matching training's self.reindex())
         dof_pos_train = self.reindex_joints_to_train(dof_pos)
         dof_vel_train = self.reindex_joints_to_train(dof_vel)
-        last_actions_train = self.reindex_joints_to_train(self.last_actions)
         contacts_train = self.reindex_feet_to_train(foot_contacts)
+
+        # last_actions stays in SDK order!
+        # Training: self.reindex(action_history_buf[:,-1]) where buf is Training order
+        # reindex(Training) = SDK (symmetric mapping), so observation has SDK order
+        last_actions_sdk = self.last_actions  # Already SDK order from policy output
 
         # Apply observation scales
         ang_vel_scaled = ang_vel * ObsScales.ang_vel
@@ -224,10 +228,10 @@ class PolicyRunner:
             np.array([cmd_vel_x]),               # [1] forward velocity command (commands[:, 0:1])
             np.array([1.0]),                     # [1] env_class != 17 (assume normal terrain)
             np.array([0.0]),                     # [1] env_class == 17
-            dof_pos_normalized,                  # [12] joint positions
-            dof_vel_scaled,                      # [12] joint velocities
-            last_actions_train,                  # [12] last actions
-            contacts_train - 0.5,                # [4] contact states, range [-0.5, 0.5]
+            dof_pos_normalized,                  # [12] joint positions (Training order)
+            dof_vel_scaled,                      # [12] joint velocities (Training order)
+            last_actions_sdk,                    # [12] last actions (SDK order - matches training!)
+            contacts_train - 0.5,                # [4] contact states (Training order), range [-0.5, 0.5]
         ]).astype(np.float32)
 
         return proprio
@@ -322,17 +326,22 @@ class PolicyRunner:
         actions_raw = self.base_policy(obs_tensor, depth_tensor)
         actions_raw = actions_raw[0].cpu().numpy()
 
-        # Clip actions before scaling (matching parkour's clip_action_before_scale)
-        # CLIP_ACTIONS = 1.2, so effective range is [-1.2, 1.2]
-        actions_clipped = np.clip(actions_raw, -CLIP_ACTIONS, CLIP_ACTIONS)
+        # Store RAW actions for next step (used in observations)
+        # Training stores raw actions in action_history_buf BEFORE clipping
+        self.last_actions = actions_raw.copy()
 
-        # Store clipped actions for next step (used in observations)
-        self.last_actions = actions_clipped.copy()
+        # Clip actions before scaling
+        # Training: clip_actions = 1.2 / action_scale = 1.2 / 0.25 = 4.8
+        effective_clip = CLIP_ACTIONS / ACTION_SCALE  # = 4.8
+        actions_clipped = np.clip(actions_raw, -effective_clip, effective_clip)
 
-        # Convert to joint targets: action * scale + default_pos
-        targets_train = actions_clipped * ACTION_SCALE + DEFAULT_STAND_ANGLES_TRAIN
+        # Convert actions from SDK to Training order (matching training's step() reindex)
+        actions_train = self.reindex_joints_to_train(actions_clipped)
 
-        # Reindex to SDK order
+        # Convert to joint targets: action * scale + default_pos (both in Training order)
+        targets_train = actions_train * ACTION_SCALE + DEFAULT_STAND_ANGLES_TRAIN
+
+        # Reindex to SDK order for motor commands
         targets_sdk = self.reindex_joints_to_sdk(targets_train)
 
         return targets_sdk, actions_raw

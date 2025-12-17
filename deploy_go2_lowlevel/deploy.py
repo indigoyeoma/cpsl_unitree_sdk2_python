@@ -543,7 +543,8 @@ class Go2Deployment:
         Returns:
             Clipped targets [12]
         """
-        if self.low_state is None:
+        # Skip if no state or kp is zero (damping mode)
+        if self.low_state is None or kp == 0:
             return targets
 
         # Get current joint state
