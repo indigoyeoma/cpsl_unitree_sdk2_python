@@ -13,8 +13,7 @@ from config import (
     BASE_JIT_PATH, VISION_WEIGHT_PATH,
     N_PROPRIO, N_SCAN, N_PRIV_EXPLICIT, N_PRIV_LATENT, HISTORY_LEN, N_OBS,
     DEPTH_LATENT_DIM, DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH,
-    SDK_TO_TRAIN_JOINTS, TRAIN_TO_SDK_JOINTS, SDK_TO_TRAIN_FEET,
-    DEFAULT_STAND_ANGLES_TRAIN, ACTION_SCALE, CLIP_ACTIONS,
+    DEFAULT_STAND_ANGLES_SDK, ACTION_SCALE, CLIP_ACTIONS,
     ObsScales
 )
 
@@ -172,18 +171,6 @@ class PolicyRunner:
         self.obs_history = None
         self.last_actions = np.zeros(12, dtype=np.float32)
 
-    def reindex_joints_to_train(self, joints_sdk: np.ndarray) -> np.ndarray:
-        """Reorder joints from SDK order to training order."""
-        return joints_sdk[SDK_TO_TRAIN_JOINTS]
-
-    def reindex_joints_to_sdk(self, joints_train: np.ndarray) -> np.ndarray:
-        """Reorder joints from training order to SDK order."""
-        return joints_train[TRAIN_TO_SDK_JOINTS]
-
-    def reindex_feet_to_train(self, feet_sdk: np.ndarray) -> np.ndarray:
-        """Reorder feet contacts from SDK order to training order."""
-        return feet_sdk[SDK_TO_TRAIN_FEET]
-
     def build_proprio_obs(
         self,
         ang_vel: np.ndarray,       # [3] gyroscope in rad/s
@@ -197,41 +184,45 @@ class PolicyRunner:
         """
         Build the proprioceptive observation vector.
 
+        Training applies reindex() to convert SIM order → SDK order for observations.
+        Real robot sensors already give SDK order, so NO reindexing needed!
+
         Returns:
-            Proprio observation [N_PROPRIO] in training convention
+            Proprio observation [N_PROPRIO] in SDK order (matches training after reindex)
         """
-        # Reindex to training order (matching training's self.reindex())
-        dof_pos_train = self.reindex_joints_to_train(dof_pos)
-        dof_vel_train = self.reindex_joints_to_train(dof_vel)
-        contacts_train = self.reindex_feet_to_train(foot_contacts)
+        # NO REINDEXING NEEDED!
+        # Training: reindex(dof_pos) converts SIM→SDK for observations
+        # Deployment: sensors already give SDK order, use directly
 
-        # last_actions stays in SDK order!
-        # Training: self.reindex(action_history_buf[:,-1]) where buf is Training order
-        # reindex(Training) = SDK (symmetric mapping), so observation has SDK order
-        last_actions_sdk = self.last_actions  # Already SDK order from policy output
-
-        # Apply observation scales
+        # Apply observation scales (all in SDK order)
         ang_vel_scaled = ang_vel * ObsScales.ang_vel
-        dof_pos_normalized = (dof_pos_train - DEFAULT_STAND_ANGLES_TRAIN) * ObsScales.dof_pos
-        dof_vel_scaled = dof_vel_train * ObsScales.dof_vel
+        dof_pos_normalized = (dof_pos - DEFAULT_STAND_ANGLES_SDK) * ObsScales.dof_pos
+        dof_vel_scaled = dof_vel * ObsScales.dof_vel
 
-        # Build observation vector (matching training order exactly)
-        # Training code: self.reindex_feet(self.contact_filt.float()-0.5)
-        # Range: [-0.5, 0.5] where -0.5=no contact, +0.5=contact
+        # last_actions from policy is SDK order (policy trained on SDK-order obs)
+        # Training: reindex(action_history_buf) also gives SDK order in observations
+        last_actions_sdk = self.last_actions  # SDK order from policy output
+
+        # Foot contacts: SDK order [FR, FL, RR, RL]
+        # Training: reindex_feet(contacts) converts SIM feet→SDK feet order
+        # Real sensors already give SDK order
+        contacts_sdk = foot_contacts  # Already SDK order
+
+        # Build observation vector (all in SDK order, matching training after reindex)
         proprio = np.concatenate([
             ang_vel_scaled,                      # [3] base angular velocity
             np.array([roll, pitch]),             # [2] orientation
             np.array([0.0]),                     # [1] delta_yaw (masked with 0*)
-            np.array([0.0]),                     # [1] delta_yaw (actual - using 0 since we don't track heading)
+            np.array([0.0]),                     # [1] delta_yaw (actual)
             np.array([0.0]),                     # [1] delta_next_yaw
             np.array([0.0, 0.0]),                # [2] commands (masked with 0*)
-            np.array([cmd_vel_x]),               # [1] forward velocity command (commands[:, 0:1])
-            np.array([1.0]),                     # [1] env_class != 17 (assume normal terrain)
+            np.array([cmd_vel_x]),               # [1] forward velocity command
+            np.array([1.0]),                     # [1] env_class != 17
             np.array([0.0]),                     # [1] env_class == 17
-            dof_pos_normalized,                  # [12] joint positions (Training order)
-            dof_vel_scaled,                      # [12] joint velocities (Training order)
-            last_actions_sdk,                    # [12] last actions (SDK order - matches training!)
-            contacts_train - 0.5,                # [4] contact states (Training order), range [-0.5, 0.5]
+            dof_pos_normalized,                  # [12] joint positions (SDK order)
+            dof_vel_scaled,                      # [12] joint velocities (SDK order)
+            last_actions_sdk,                    # [12] last actions (SDK order)
+            contacts_sdk - 0.5,                  # [4] contact states (SDK order)
         ]).astype(np.float32)
 
         return proprio
@@ -335,14 +326,13 @@ class PolicyRunner:
         effective_clip = CLIP_ACTIONS / ACTION_SCALE  # = 4.8
         actions_clipped = np.clip(actions_raw, -effective_clip, effective_clip)
 
-        # Convert actions from SDK to Training order (matching training's step() reindex)
-        actions_train = self.reindex_joints_to_train(actions_clipped)
+        # Policy outputs actions in SDK order (trained on SDK-order observations)
+        # Training: reindex(policy_output) converts SDK→SIM for physics
+        # Deployment: motors expect SDK order, so NO reindexing needed!
+        actions_sdk = actions_clipped  # Already SDK order from policy
 
-        # Convert to joint targets: action * scale + default_pos (both in Training order)
-        targets_train = actions_train * ACTION_SCALE + DEFAULT_STAND_ANGLES_TRAIN
-
-        # Reindex to SDK order for motor commands
-        targets_sdk = self.reindex_joints_to_sdk(targets_train)
+        # Convert to joint targets: action * scale + default_pos (both in SDK order)
+        targets_sdk = actions_sdk * ACTION_SCALE + DEFAULT_STAND_ANGLES_SDK
 
         return targets_sdk, actions_raw
 

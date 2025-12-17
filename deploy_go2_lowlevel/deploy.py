@@ -3,7 +3,9 @@
 Go2 Vision Policy Deployment Script
 
 Controls:
-    Y:  Stand up (from IDLE) / Sit down (from STANDING) / Reset policy (from WALKING)
+    Y:  Stand up (from IDLE) - 2-phase interpolation like Unitree example
+    B:  Sit down (from STANDING) - current -> sit position
+    Y:  Reset policy (from WALKING) - returns to standing
     L1: Enable walking policy (when standing)
     R2/L2: EMERGENCY STOP - cuts all motor power
 
@@ -57,7 +59,7 @@ VelStopF = 16000.0
 class State(IntEnum):
     """Robot state machine states."""
     IDLE = 0           # Damping mode, waiting for commands
-    STANDING_UP = 1    # Interpolating to stand pose
+    STANDING_UP = 1    # Interpolating to stand pose (2 phases like Unitree)
     STANDING = 2       # Holding stand pose
     WALKING = 3        # Running vision policy
     SITTING_DOWN = 4   # Interpolating to sit pose
@@ -108,12 +110,12 @@ class Go2Deployment:
         self.target_pos = DEFAULT_STAND_ANGLES_SDK.copy()
         self.current_target = DEFAULT_STAND_ANGLES_SDK.copy()
 
-        # Standing/sitting interpolation (tick-based like Unitree example)
-        # Unitree uses: percent += 1.0 / duration_ticks each tick
-        self.interp_start_pos = np.zeros(12, dtype=np.float32)
-        self.interp_target_pos = np.zeros(12, dtype=np.float32)
-        self.interp_percent = 0.0
-        self.interp_duration_ticks = 500  # 500 ticks @ 500Hz = 1 second
+        # Unitree-style direct interpolation (like go2_stand_example.py)
+        self.startPos = np.zeros(12, dtype=np.float32)
+        self.percent_1 = 0.0  # Phase 1: current -> sit
+        self.percent_2 = 0.0  # Phase 2: sit -> stand
+        self.duration_1 = 500  # 500 ticks @ 500Hz = 1 second
+        self.duration_2 = 500  # 500 ticks @ 500Hz = 1 second
 
         # Button state for edge detection (print only on press)
         self._last_buttons = 0
@@ -244,16 +246,17 @@ class Go2Deployment:
         print("Initialization complete!")
         print()
         print("Controls:")
-        print("  Y:  Stand (from IDLE) / Sit (from STANDING) / Reset (from WALKING)")
+        print("  Y:  Stand up (from IDLE) - 2-phase like Unitree")
+        print("  B:  Sit down (from STANDING) - current -> sit")
         print("  L1: Enable walking policy (when standing)")
         print("  R2/L2: EMERGENCY STOP")
         print()
         print("State flow:")
-        print("  IDLE --(Y)--> STANDING_UP --> STANDING --(L1)--> WALKING")
-        print("                                    |                  |")
-        print("                                   (Y)                (Y)")
-        print("                                    v                  v")
-        print("  IDLE <-- SITTING_DOWN <--------- + <---- (reset) ---+")
+        print("  IDLE --(Y)--> STANDING_UP (2-phase) --> STANDING --(L1)--> WALKING")
+        print("                                              |                  |")
+        print("                                             (B)                (Y)")
+        print("                                              v                  v")
+        print("  IDLE <-- SITTING_DOWN <----------------- + <---- (reset) ----+")
         print("=" * 60)
         print()
 
@@ -380,11 +383,11 @@ class Go2Deployment:
         if extra_debug:
             if extra_debug.get('last_actions') is not None:
                 actions = extra_debug['last_actions']
-                self.log_file.write(f"\n[Last Actions (Training order, raw from policy)]\n")
-                self.log_file.write(f"  FL: [{actions[0]:+.4f}, {actions[1]:+.4f}, {actions[2]:+.4f}]\n")
-                self.log_file.write(f"  FR: [{actions[3]:+.4f}, {actions[4]:+.4f}, {actions[5]:+.4f}]\n")
-                self.log_file.write(f"  RL: [{actions[6]:+.4f}, {actions[7]:+.4f}, {actions[8]:+.4f}]\n")
-                self.log_file.write(f"  RR: [{actions[9]:+.4f}, {actions[10]:+.4f}, {actions[11]:+.4f}]\n")
+                self.log_file.write(f"\n[Last Actions (SDK order, raw from policy)]\n")
+                self.log_file.write(f"  FR: [{actions[0]:+.4f}, {actions[1]:+.4f}, {actions[2]:+.4f}]\n")
+                self.log_file.write(f"  FL: [{actions[3]:+.4f}, {actions[4]:+.4f}, {actions[5]:+.4f}]\n")
+                self.log_file.write(f"  RR: [{actions[6]:+.4f}, {actions[7]:+.4f}, {actions[8]:+.4f}]\n")
+                self.log_file.write(f"  RL: [{actions[9]:+.4f}, {actions[10]:+.4f}, {actions[11]:+.4f}]\n")
 
         self.log_file.write("\n")
         self.log_file.flush()  # Ensure data is written
@@ -466,45 +469,6 @@ class Go2Deployment:
         remote = self.low_state.wireless_remote
         return remote[2] | (remote[3] << 8)
 
-    def _init_interpolation(self, target_pos: np.ndarray, duration_ticks: int = 500):
-        """
-        Initialize position interpolation (exactly like Unitree example).
-
-        Args:
-            target_pos: Target joint positions
-            duration_ticks: Number of ticks for interpolation (500 ticks @ 500Hz = 1 second)
-        """
-        if self.low_state is not None:
-            self.interp_start_pos = np.array([
-                self.low_state.motor_state[i].q for i in range(12)
-            ], dtype=np.float32)
-        else:
-            self.interp_start_pos = DEFAULT_STAND_ANGLES_SDK.copy()
-        self.interp_target_pos = target_pos.copy()
-        self.interp_duration_ticks = duration_ticks
-        self.interp_percent = 0.0
-
-    def _compute_interpolation(self) -> np.ndarray:
-        """
-        Compute tick-based linear interpolation (exactly like Unitree example).
-
-        Unitree code:
-            self.percent_1 += 1.0 / self.duration_1
-            self.percent_1 = min(self.percent_1, 1)
-            q = (1 - percent) * startPos + percent * targetPos
-        """
-        # Increment percent (exactly like Unitree)
-        self.interp_percent += 1.0 / self.interp_duration_ticks
-        self.interp_percent = min(self.interp_percent, 1.0)
-
-        # Linear interpolation (exactly like Unitree)
-        target = (1.0 - self.interp_percent) * self.interp_start_pos + self.interp_percent * self.interp_target_pos
-
-        return target
-
-    def _is_interpolation_complete(self) -> bool:
-        """Check if interpolation is complete."""
-        return self.interp_percent >= 1.0
 
     def _enter_state(self, new_state: State):
         """Transition to a new state."""
@@ -514,16 +478,23 @@ class Go2Deployment:
 
         # State entry actions
         if new_state == State.STANDING_UP:
-            # Initialize interpolation to stand pose (500 ticks = 1 second, like Unitree)
-            self._init_interpolation(DEFAULT_STAND_ANGLES_SDK, duration_ticks=500)
-            print("STATE: Standing up...")
+            # Capture current position and reset percent counters (like Unitree example)
+            if self.low_state is not None:
+                for i in range(12):
+                    self.startPos[i] = self.low_state.motor_state[i].q
+            self.percent_1 = 0.0
+            self.percent_2 = 0.0
+            print("STATE: Standing up (2-phase like Unitree)...")
 
         elif new_state == State.STANDING:
             print("STATE: Standing - press L1 to walk, Y to sit")
 
         elif new_state == State.SITTING_DOWN:
-            # Initialize interpolation to sit pose (500 ticks = 1 second, like Unitree)
-            self._init_interpolation(SIT_ANGLES_SDK, duration_ticks=500)
+            # Capture current position and reset percent (single phase sit down)
+            if self.low_state is not None:
+                for i in range(12):
+                    self.startPos[i] = self.low_state.motor_state[i].q
+            self.percent_1 = 0.0
             print("STATE: Sitting down...")
 
         elif new_state == State.WALKING:
@@ -644,17 +615,17 @@ class Go2Deployment:
         new_presses = buttons & ~self._last_buttons
         if new_presses:
             if new_presses & self.WirelessButtons.Y:
-                print("  [Button] Y pressed")
+                print("  [Button] Y pressed", flush=True)
             if new_presses & self.WirelessButtons.L1:
-                print("  [Button] L1 pressed")
+                print("  [Button] L1 pressed", flush=True)
             if new_presses & self.WirelessButtons.R2:
-                print("  [Button] R2 pressed")
+                print("  [Button] R2 pressed", flush=True)
             if new_presses & self.WirelessButtons.L2:
-                print("  [Button] L2 pressed")
+                print("  [Button] L2 pressed", flush=True)
             if new_presses & self.WirelessButtons.A:
-                print("  [Button] A pressed")
+                print("  [Button] A pressed", flush=True)
             if new_presses & self.WirelessButtons.B:
-                print("  [Button] B pressed")
+                print("  [Button] B pressed", flush=True)
         self._last_buttons = buttons
 
         # Emergency stop takes priority - LATCHING (R2 or L2)
@@ -675,13 +646,35 @@ class Go2Deployment:
                 self._enter_state(State.STANDING_UP)
 
         elif self.state == State.STANDING_UP:
-            # Time-based smooth interpolation (like Unitree example)
-            # Skip torque limiting - interpolation ensures smooth motion
-            self.current_target = self._compute_interpolation()
-            self._send_motor_commands(self.current_target, KP_STAND, KD_STAND, skip_torque_limit=True)
+            # Unitree-style 2-phase interpolation (exactly like go2_stand_example.py)
+            # Phase 1: startPos -> SIT_ANGLES_SDK
+            self.percent_1 += 1.0 / self.duration_1
+            self.percent_1 = min(self.percent_1, 1)
+            if self.percent_1 < 1:
+                for i in range(12):
+                    self.low_cmd.motor_cmd[i].q = (1 - self.percent_1) * self.startPos[i] + self.percent_1 * SIT_ANGLES_SDK[i]
+                    self.low_cmd.motor_cmd[i].dq = 0
+                    self.low_cmd.motor_cmd[i].kp = KP_STAND
+                    self.low_cmd.motor_cmd[i].kd = KD_STAND
+                    self.low_cmd.motor_cmd[i].tau = 0
 
-            # Check if interpolation complete
-            if self._is_interpolation_complete():
+            # Phase 2: SIT_ANGLES_SDK -> DEFAULT_STAND_ANGLES_SDK
+            if (self.percent_1 == 1) and (self.percent_2 <= 1):
+                self.percent_2 += 1.0 / self.duration_2
+                self.percent_2 = min(self.percent_2, 1)
+                for i in range(12):
+                    self.low_cmd.motor_cmd[i].q = (1 - self.percent_2) * SIT_ANGLES_SDK[i] + self.percent_2 * DEFAULT_STAND_ANGLES_SDK[i]
+                    self.low_cmd.motor_cmd[i].dq = 0
+                    self.low_cmd.motor_cmd[i].kp = KP_STAND
+                    self.low_cmd.motor_cmd[i].kd = KD_STAND
+                    self.low_cmd.motor_cmd[i].tau = 0
+
+            self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+            if not self.dryrun:
+                self.lowcmd_publisher.Write(self.low_cmd)
+
+            # Check if both phases complete
+            if (self.percent_1 == 1) and (self.percent_2 == 1):
                 self._enter_state(State.STANDING)
 
         elif self.state == State.STANDING:
@@ -691,7 +684,10 @@ class Go2Deployment:
             # L1 to start walking (like parkour)
             if buttons & self.WirelessButtons.L1:
                 self._enter_state(State.WALKING)
-            # Y to sit down
+            # B to sit down (current -> sit)
+            elif buttons & self.WirelessButtons.B:
+                self._enter_state(State.SITTING_DOWN)
+            # Y to sit down (same as B for convenience)
             elif buttons & self.WirelessButtons.Y:
                 self._enter_state(State.SITTING_DOWN)
 
@@ -711,13 +707,22 @@ class Go2Deployment:
                 self._enter_state(State.STANDING)
 
         elif self.state == State.SITTING_DOWN:
-            # Time-based smooth interpolation to sit pose
-            # Skip torque limiting - interpolation ensures smooth motion
-            self.current_target = self._compute_interpolation()
-            self._send_motor_commands(self.current_target, KP_STAND, KD_STAND, skip_torque_limit=True)
+            # Unitree-style single-phase: current -> SIT_ANGLES_SDK
+            self.percent_1 += 1.0 / self.duration_1
+            self.percent_1 = min(self.percent_1, 1)
+            for i in range(12):
+                self.low_cmd.motor_cmd[i].q = (1 - self.percent_1) * self.startPos[i] + self.percent_1 * SIT_ANGLES_SDK[i]
+                self.low_cmd.motor_cmd[i].dq = 0
+                self.low_cmd.motor_cmd[i].kp = KP_STAND
+                self.low_cmd.motor_cmd[i].kd = KD_STAND
+                self.low_cmd.motor_cmd[i].tau = 0
 
-            # Check if interpolation complete
-            if self._is_interpolation_complete():
+            self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+            if not self.dryrun:
+                self.lowcmd_publisher.Write(self.low_cmd)
+
+            # Check if complete
+            if self.percent_1 == 1:
                 self._enter_state(State.IDLE)
 
         elif self.state == State.EMERGENCY:
