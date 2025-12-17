@@ -32,7 +32,7 @@ class D435iCamera:
         target_height: int = 58,
         near_clip: float = 0.3,
         far_clip: float = 3.0,
-        rotate_180: bool = False,  # Set True if camera is mounted inverted
+        rotate_180: bool = True,  # Default True for Go2 camera mounting
         # Cropping settings - MORE aggressive left crop to remove D435i edge artifact
         # Parkour uses crop_left=28 but our D435i has artifact extending to cols 0-3 after resize
         # Increase left crop to remove ~5% more (640 * 0.09 ≈ 58)

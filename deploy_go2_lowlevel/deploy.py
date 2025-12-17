@@ -113,10 +113,17 @@ class Go2VisionController:
         self.emergency_stop = False  # L2/R2 emergency stop flag
         self.torque_clip_enabled = True  # Enable torque clipping for safety
 
-        # Button state (for edge detection)
+        # Button state with latching buffer (like parkour)
+        # Buttons are latched when pressed and stay latched until consumed
         self.prev_buttons = 0
-        self.button_y_pressed = False
-        self.button_l1_pressed = False
+        self.button_buffer = {
+            'Y': False,
+            'L1': False,
+            'A': False,
+            'B': False,
+            'L2': False,
+            'R2': False,
+        }
 
         # Observation buffers
         self.obs_history = deque(maxlen=config.history_len)
@@ -324,37 +331,74 @@ class Go2VisionController:
         buttons = data1 | (data2 << 8)
         return buttons
 
-    def _check_button_pressed(self, button_mask):
-        """Check if button was just pressed (edge detection)."""
-        buttons = self._get_button_state()
-        # Rising edge: button is pressed now but wasn't before
-        pressed = (buttons & button_mask) and not (self.prev_buttons & button_mask)
-        return pressed
+    def _update_button_buffer(self):
+        """Update button buffer with latching (like parkour).
 
-    def _update_button_state(self):
-        """Update previous button state for edge detection."""
-        self.prev_buttons = self._get_button_state()
+        Detects rising edges and latches them in the buffer.
+        Buttons stay latched until explicitly consumed by _consume_button().
+        This ensures button presses are never missed even if brief.
+        """
+        buttons = self._get_button_state()
+
+        # Check each button for rising edge (pressed now, wasn't before)
+        button_map = {
+            'Y': self.BUTTON_Y,
+            'L1': self.BUTTON_L1,
+            'A': self.BUTTON_A,
+            'B': self.BUTTON_B,
+            'L2': self.BUTTON_L2,
+            'R2': self.BUTTON_R2,
+        }
+
+        for name, mask in button_map.items():
+            # Rising edge detection: pressed now but wasn't before
+            if (buttons & mask) and not (self.prev_buttons & mask):
+                self.button_buffer[name] = True
+
+        # Update previous state for next iteration
+        self.prev_buttons = buttons
+
+    def _consume_button(self, name):
+        """Check if button was pressed and consume it from buffer.
+
+        Returns True if button was pressed (and clears the latch).
+        Returns False if button was not pressed.
+        """
+        if self.button_buffer.get(name, False):
+            self.button_buffer[name] = False
+            return True
+        return False
+
+    def _check_button(self, name):
+        """Check if button is latched without consuming it."""
+        return self.button_buffer.get(name, False)
 
     def _check_emergency_stop(self):
-        """Check L2/R2 buttons for emergency stop (from parkour)."""
+        """Check L2/R2 buttons for emergency stop (from parkour).
+
+        Emergency stop checks the live button state AND the buffer
+        to ensure we never miss an emergency stop request.
+        """
         buttons = self._get_button_state()
-        return (buttons & self.BUTTON_L2) or (buttons & self.BUTTON_R2)
+        live_pressed = (buttons & self.BUTTON_L2) or (buttons & self.BUTTON_R2)
+        buffered = self.button_buffer.get('L2', False) or self.button_buffer.get('R2', False)
+        return live_pressed or buffered
 
     def _check_y_pressed(self):
-        """Check if Y button was just pressed."""
-        return self._check_button_pressed(self.BUTTON_Y)
+        """Check if Y button was pressed and consume it."""
+        return self._consume_button('Y')
 
     def _check_l1_pressed(self):
-        """Check if L1 button was just pressed."""
-        return self._check_button_pressed(self.BUTTON_L1)
+        """Check if L1 button was pressed and consume it."""
+        return self._consume_button('L1')
 
     def _check_a_pressed(self):
-        """Check if A button was just pressed."""
-        return self._check_button_pressed(self.BUTTON_A)
+        """Check if A button was pressed and consume it."""
+        return self._consume_button('A')
 
     def _check_b_pressed(self):
-        """Check if B button was just pressed."""
-        return self._check_button_pressed(self.BUTTON_B)
+        """Check if B button was pressed and consume it."""
+        return self._consume_button('B')
 
     def _print_depth_data(self):
         """Print detailed depth camera data for debugging."""
@@ -389,7 +433,7 @@ class Go2VisionController:
         asymmetry = left_avg - right_avg
         print(f"\nAsymmetry (left - right): {asymmetry:+.3f}")
         if abs(asymmetry) > 0.15:
-            print(f"  >>> HIGH ASYMMETRY! Try --rotate_camera flag <<<")
+            print(f"  >>> HIGH ASYMMETRY! Try --no_rotate_camera flag <<<")
 
         # Save for external analysis
         np.save("depth_snapshot.npy", depth_image)
@@ -437,7 +481,10 @@ class Go2VisionController:
             print(f"\n✓ Captured start position")
             self._print_controls()
 
-        # Handle button inputs based on current phase
+        # Update button buffer FIRST (captures rising edges and latches them)
+        self._update_button_buffer()
+
+        # Handle button inputs based on current phase (consumes from buffer)
         self._handle_button_inputs()
 
         # Execute current phase
@@ -455,9 +502,6 @@ class Go2VisionController:
             self._phase_debug()
         elif self.phase == self.PHASE_EMERGENCY:
             pass  # Motors already disabled
-
-        # Update button state for edge detection
-        self._update_button_state()
 
         # Send motor commands (except in IDLE and EMERGENCY)
         if self.phase not in [self.PHASE_IDLE, self.PHASE_EMERGENCY]:
@@ -601,7 +645,7 @@ class Go2VisionController:
             f.write(f"  col 65:          {sample_pixels[3]:+.3f}\n")
             f.write(f"  col 86 (right):  {sample_pixels[4]:+.3f}\n")
             f.write(f"\n>>> Turn LEFT = yaw increases, LEFT depth should change\n")
-            f.write(f">>> If RIGHT changes instead, use --rotate_camera\n")
+            f.write(f">>> If RIGHT changes instead, use --no_rotate_camera\n")
 
         print(f"    Saved to: depth_imu_log.txt")
 
@@ -785,7 +829,7 @@ class Go2VisionController:
         asymmetry = left_avg - right_avg
         debug_print(f"\n  Asymmetry (left - right): {asymmetry:+.3f}")
         if abs(asymmetry) > 0.2:
-            debug_print(f"  WARNING: High asymmetry! Try --rotate_camera flag")
+            debug_print(f"  WARNING: High asymmetry! Try --no_rotate_camera flag")
 
         # Save depth image
         np.save("debug_depth.npy", depth_image)
@@ -1421,8 +1465,8 @@ def main():
                         help='Network interface for DDS')
     parser.add_argument('--skip_standup', action='store_true',
                         help='Skip sit-to-stand transition, start in standing pose (like simulator)')
-    parser.add_argument('--rotate_camera', action='store_true',
-                        help='Rotate camera 180 degrees (for inverted mounting like parkour)')
+    parser.add_argument('--no_rotate_camera', action='store_true',
+                        help='Disable default 180° camera rotation')
     parser.add_argument('--no_torque_clip', action='store_true',
                         help='Disable torque clipping (not recommended)')
     parser.add_argument('--zero_yaw', action='store_true',
@@ -1468,12 +1512,12 @@ def main():
         target_height=DeployConfig.depth_height,
         near_clip=DeployConfig.depth_near,
         far_clip=DeployConfig.depth_far,
-        rotate_180=args.rotate_camera,  # For inverted camera mounting
+        rotate_180=not args.no_rotate_camera,  # Default: rotate 180° for Go2 camera mounting
     )
     print(f"✓ Camera: 640x480 → crop(L=28,R=36,T=48,B=0) → resize to {DeployConfig.depth_width}x{DeployConfig.depth_height}")
     print(f"  Depth range: {DeployConfig.depth_near}m - {DeployConfig.depth_far}m → normalized [-0.5, +0.5]")
-    if args.rotate_camera:
-        print("✓ Camera rotation enabled (180°)")
+    if not args.no_rotate_camera:
+        print("✓ Camera rotation enabled (180° - default for Go2)")
 
     # Setup config
     config = DeployConfig()
