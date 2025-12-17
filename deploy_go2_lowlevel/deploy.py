@@ -98,6 +98,7 @@ class Go2Deployment:
         # Button state (for edge detection)
         self.prev_buttons = 0
         self.button_pressed = {}
+        self.button_hold_time = {}  # Track how long buttons are held
 
         # Components
         self.camera: Optional[DepthCamera] = None
@@ -398,13 +399,48 @@ class Go2Deployment:
         BUTTON_X = 1 << 10
         BUTTON_Y = 1 << 11
 
-        # Detect rising edges
+        # Current button states (level detection for responsiveness)
+        y_pressed = bool(buttons & BUTTON_Y)
+        l1_pressed = bool(buttons & BUTTON_L1)
+        r2_pressed = bool(buttons & BUTTON_R2)
+        a_pressed = bool(buttons & BUTTON_A)
+        b_pressed = bool(buttons & BUTTON_B)
+
+        # Previous states
+        y_was_pressed = bool(self.prev_buttons & BUTTON_Y)
+        l1_was_pressed = bool(self.prev_buttons & BUTTON_L1)
+        a_was_pressed = bool(self.prev_buttons & BUTTON_A)
+        b_was_pressed = bool(self.prev_buttons & BUTTON_B)
+
+        # Track hold times for responsive button detection
+        current_time = time.time()
+        HOLD_THRESHOLD = 0.1  # Trigger after holding 100ms
+
+        for btn, pressed in [('Y', y_pressed), ('L1', l1_pressed)]:
+            if pressed:
+                if btn not in self.button_hold_time:
+                    self.button_hold_time[btn] = current_time
+            else:
+                self.button_hold_time.pop(btn, None)
+
+        # Rising edge OR held long enough triggers action
+        y_trigger = (y_pressed and not y_was_pressed) or \
+                    (y_pressed and self.button_hold_time.get('Y', current_time) <= current_time - HOLD_THRESHOLD)
+        l1_trigger = (l1_pressed and not l1_was_pressed) or \
+                     (l1_pressed and self.button_hold_time.get('L1', current_time) <= current_time - HOLD_THRESHOLD)
+
+        # Clear hold time after triggering to prevent repeated triggers
+        if y_trigger and 'Y' in self.button_hold_time:
+            self.button_hold_time['Y'] = current_time + 1.0  # Prevent re-trigger for 1 second
+        if l1_trigger and 'L1' in self.button_hold_time:
+            self.button_hold_time['L1'] = current_time + 1.0
+
         self.button_pressed = {
-            'Y': bool(buttons & BUTTON_Y) and not bool(self.prev_buttons & BUTTON_Y),
-            'L1': bool(buttons & BUTTON_L1) and not bool(self.prev_buttons & BUTTON_L1),
-            'R2': bool(buttons & BUTTON_R2),  # No edge detection for emergency
-            'A': bool(buttons & BUTTON_A) and not bool(self.prev_buttons & BUTTON_A),
-            'B': bool(buttons & BUTTON_B) and not bool(self.prev_buttons & BUTTON_B),
+            'Y': y_trigger,
+            'L1': l1_trigger,
+            'R2': r2_pressed,  # Level detection for emergency (always active when held)
+            'A': a_pressed and not a_was_pressed,
+            'B': b_pressed and not b_was_pressed,
         }
 
         self.prev_buttons = buttons
