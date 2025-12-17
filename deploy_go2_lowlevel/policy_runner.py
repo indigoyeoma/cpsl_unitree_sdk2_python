@@ -158,6 +158,27 @@ class PolicyRunner:
             # Initialize history buffer
             self.reset()
 
+            # GPU warmup - first inference is slow due to CUDA memory allocation
+            print("Running GPU warmup...")
+            dummy_depth = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
+            dummy_ang_vel = np.zeros(3, dtype=np.float32)
+            dummy_dof_pos = DEFAULT_STAND_ANGLES_SDK.copy()
+            dummy_dof_vel = np.zeros(12, dtype=np.float32)
+            dummy_contacts = np.ones(4, dtype=np.float32)
+
+            import time
+            for i in range(5):
+                t0 = time.time()
+                self.run_inference(
+                    dummy_depth, dummy_ang_vel, 0.0, 0.0,
+                    dummy_dof_pos, dummy_dof_vel, dummy_contacts, 0.5
+                )
+                t1 = time.time()
+                print(f"  Warmup {i+1}/5: {(t1-t0)*1000:.1f}ms")
+
+            self.reset()  # Reset history after warmup
+            print("GPU warmup complete")
+
             return True
 
         except Exception as e:

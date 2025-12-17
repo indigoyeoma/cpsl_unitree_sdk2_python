@@ -741,7 +741,9 @@ class Go2Deployment:
         Returns:
             Joint position targets in SDK order [12], or None if depth camera fails
         """
-        # Get depth frame
+        t_start = time.time()
+
+        # Get depth frame (from buffer - should be instant)
         if self.camera is not None and not self.no_camera:
             depth = self.camera.get_frame()
             if depth is None:
@@ -772,6 +774,8 @@ class Go2Deployment:
             1.0 if state.foot_force[i] > 20 else 0.0 for i in range(4)
         ], dtype=np.float32)
 
+        t_before_inference = time.time()
+
         # Run inference (returns targets and raw_actions for logging)
         targets, raw_actions = self.policy.run_inference(
             depth_image=depth,
@@ -783,6 +787,20 @@ class Go2Deployment:
             foot_contacts=foot_contacts,
             cmd_vel_x=FIXED_VEL_X,
         )
+
+        t_after_inference = time.time()
+
+        # Print timing diagnostics periodically
+        if self.policy_tick % 50 == 0:  # Every 50 ticks (~1 second at 50Hz)
+            total_ms = (t_after_inference - t_start) * 1000
+            inference_ms = (t_after_inference - t_before_inference) * 1000
+            print(f"  [Timing] tick={self.policy_tick}: total={total_ms:.1f}ms, inference={inference_ms:.1f}ms")
+
+        # Warn if actions are exploding (should be roughly [-2, 2] for normal walking)
+        action_max = np.abs(raw_actions).max()
+        if action_max > 3.0:
+            print(f"  [WARNING] tick={self.policy_tick}: Large raw actions! max={action_max:.3f}")
+            print(f"    raw_actions={raw_actions}")
 
         # Log comprehensive data for debugging
         depth_stats = {
