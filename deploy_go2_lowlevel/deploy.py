@@ -932,35 +932,33 @@ class Go2VisionController:
             # Run policy inference
             action = self.policy.get_action(depth_image, obs)
 
-            # PARKOUR-STYLE ACTION HANDLING (exactly matching parkour):
-            # 1. clip_actions is ONLY for storing last_action in observation
-            # 2. RAW action * scale goes to torque clipping (in _send_command)
+            # PARKOUR-STYLE ACTION HANDLING:
+            # Parkour clips action BEFORE computing target (line 566 in unitree_ros2_real.py)
+            # This limits the target position range, preventing extreme movements
 
-            # Clip for observation storage only (matches parkour clip_action_before_scale)
-            # Parkour clips to ±clip_actions (1.2), NOT ±(clip_actions/action_scale)
-            action_for_obs = np.clip(action, -self.config.clip_actions, self.config.clip_actions)
+            # Clip action to ±clip_actions (1.2) - REQUIRED for stable walking
+            action_clipped = np.clip(action, -self.config.clip_actions, self.config.clip_actions)
 
-            # Scale RAW action (no pre-clipping, torque clipping handles safety)
-            # Parkour does NOT apply joint limits clipping - only torque clipping
-            target_delta = action * self.config.action_scale
+            # Scale CLIPPED action to compute target position
+            target_delta = action_clipped * self.config.action_scale
             target_pos = self.config.default_joint_angles + target_delta
 
             self.target_positions = target_pos
 
             # Store CLIPPED action for observation (last_action in next obs)
-            self.last_action = action_for_obs
-            self.action_history.append(action_for_obs)
+            self.last_action = action_clipped
+            self.action_history.append(action_clipped)
 
             # Log data every 10 policy steps (5 times per second)
             self.walk_startup_counter += 1
             if self.walk_startup_counter % 10 == 0:
-                self._log_walk_data(depth_image, obs, action, action_for_obs, target_pos)
+                self._log_walk_data(depth_image, obs, action, action_clipped, target_pos)
 
             # Print summary every second
             if self.walk_startup_counter % 50 == 0:
                 yaw_clamped = " CLAMPED!" if abs(self.delta_yaw) > 0.5 else ""
                 print(f"  Raw: [{action.min():.2f},{action.max():.2f}] | "
-                      f"Obs(±{self.config.clip_actions:.1f}): [{action_for_obs.min():.2f},{action_for_obs.max():.2f}] | "
+                      f"Clipped(±{self.config.clip_actions:.1f}): [{action_clipped.min():.2f},{action_clipped.max():.2f}] | "
                       f"d={self.distance_traveled:.2f}m yaw={np.degrees(self.delta_yaw):.1f}°{yaw_clamped}")
 
     def _log_walk_data(self, depth_image, obs, action_raw, action_clipped, target_pos):
