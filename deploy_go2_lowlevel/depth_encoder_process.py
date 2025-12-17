@@ -177,7 +177,7 @@ def depth_encoder_loop(
         GOAL_Y = 0.0    # 0 = straight, +2 = 2m left, -2 = 2m right
 
         # Hardware drift correction (add to delta_yaw to counteract drift)
-        DRIFT_CORRECTION = 0.25  # positive = turn left, tune if needed
+        DRIFT_CORRECTION = 0.23  # positive = turn left, tune if needed
 
         import math
 
