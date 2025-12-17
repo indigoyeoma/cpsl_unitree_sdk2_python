@@ -4,8 +4,7 @@ Go2 Vision Policy Deployment Script
 
 Controls:
     Y:  Stand up (from IDLE) - 2-phase interpolation like Unitree example
-    B:  Sit down (from STANDING) - current -> sit position
-    Y:  Reset policy (from WALKING) - returns to standing
+    B:  Sit down (from STANDING/WALKING) - current -> sit position
     L1: Enable walking policy (when standing)
     R2/L2: EMERGENCY STOP - cuts all motor power
 
@@ -247,16 +246,16 @@ class Go2Deployment:
         print()
         print("Controls:")
         print("  Y:  Stand up (from IDLE) - 2-phase like Unitree")
-        print("  B:  Sit down (from STANDING) - current -> sit")
+        print("  B:  Sit down (from STANDING or WALKING)")
         print("  L1: Enable walking policy (when standing)")
         print("  R2/L2: EMERGENCY STOP")
         print()
         print("State flow:")
         print("  IDLE --(Y)--> STANDING_UP (2-phase) --> STANDING --(L1)--> WALKING")
         print("                                              |                  |")
-        print("                                             (B)                (Y)")
+        print("                                             (B)                (B)")
         print("                                              v                  v")
-        print("  IDLE <-- SITTING_DOWN <----------------- + <---- (reset) ----+")
+        print("  IDLE <--------------- SITTING_DOWN <--------+------------------+")
         print("=" * 60)
         print()
 
@@ -687,24 +686,30 @@ class Go2Deployment:
             # B to sit down (current -> sit)
             elif buttons & self.WirelessButtons.B:
                 self._enter_state(State.SITTING_DOWN)
-            # Y to sit down (same as B for convenience)
-            elif buttons & self.WirelessButtons.Y:
-                self._enter_state(State.SITTING_DOWN)
 
         elif self.state == State.WALKING:
             # Run policy at 50Hz
             if self.tick % POLICY_DECIMATION == 0:
                 self.policy_tick += 1
-                self.current_target = self._run_policy()
+                policy_result = self._run_policy()
+
+                # Check if policy failed (depth is None)
+                if policy_result is None:
+                    print("  Depth camera failed - stopping policy and sitting down")
+                    self.policy.reset()
+                    self._enter_state(State.SITTING_DOWN)
+                    return
+
+                self.current_target = policy_result
 
             # Keep torque limiting during walking for safety
             self._send_motor_commands(self.current_target, KP_WALK, KD_WALK)
 
-            # Y to reset policy and return to standing
-            if buttons & self.WirelessButtons.Y:
+            # B to reset policy and sit down
+            if buttons & self.WirelessButtons.B:
                 self.policy.reset()
-                print("  Policy reset - returning to stand")
-                self._enter_state(State.STANDING)
+                print("  Policy reset - sitting down")
+                self._enter_state(State.SITTING_DOWN)
 
         elif self.state == State.SITTING_DOWN:
             # Unitree-style single-phase: current -> SIT_ANGLES_SDK
@@ -729,18 +734,22 @@ class Go2Deployment:
             self._send_emergency_stop()
             # Can only exit emergency with restart
 
-    def _run_policy(self) -> np.ndarray:
+    def _run_policy(self) -> Optional[np.ndarray]:
         """
         Run one step of the vision policy.
 
         Returns:
-            Joint position targets in SDK order [12]
+            Joint position targets in SDK order [12], or None if depth camera fails
         """
         # Get depth frame
-        if self.camera is not None:
+        if self.camera is not None and not self.no_camera:
             depth = self.camera.get_frame()
             if depth is None:
-                depth = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
+                print("WARNING: Depth frame is None - cancelling policy!")
+                return None  # Signal to stop policy
+        elif self.no_camera:
+            # No camera mode - use dummy depth
+            depth = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
         else:
             depth = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
 
