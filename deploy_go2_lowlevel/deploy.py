@@ -1294,6 +1294,11 @@ class Go2VisionController:
 
         # Use SDK order directly - it matches training observation order!
         dof_pos = joint_pos - self.config.default_joint_angles  # Both in SDK order
+
+        # CLAMP dof_pos to training distribution (prevents feedback loop)
+        # Training rarely sees values beyond ±0.5, values like -0.64 cause extreme outputs
+        dof_pos = np.clip(dof_pos, -0.5, 0.5)
+
         last_action = self.last_action if len(self.action_history) > 0 else np.zeros(12)
 
         # Contacts (SDK: FR=0, FL=1, RR=2, RL=3)
@@ -1328,7 +1333,7 @@ class Go2VisionController:
             [delta_next_yaw_clipped],       # delta_next_yaw [7] - CLAMPED to ±0.5
             [0.0, 0.0],                     # 0*commands[:2] (MASKED vx,vy) [8:10]
             [self.config.command_vx],       # commands[0:1] = vx [10] - forward velocity
-            [1.0, 0.0],                     # env_class flags [11:13]
+            [0.0, 1.0],                     # env_class flags [11:13] - parkour_flat (env_class=17)
             dof_pos * dof_pos_scale,        # 12 [13:25]
             joint_vel * dof_vel_scale,      # 12 [25:37] (SDK order = observation order)
             last_action,                    # 12 [37:49]
