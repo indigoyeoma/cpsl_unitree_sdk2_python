@@ -467,7 +467,7 @@ class Go2VisionController:
         asymmetry = left_avg - right_avg
         print(f"\nAsymmetry (left - right): {asymmetry:+.3f}")
         if abs(asymmetry) > 0.15:
-            print(f"  >>> HIGH ASYMMETRY! Try --no_rotate_camera flag <<<")
+            print(f"  >>> HIGH ASYMMETRY! Try --rotate_camera flag <<<")
 
         # Save for external analysis
         np.save("depth_snapshot.npy", depth_image)
@@ -475,18 +475,18 @@ class Go2VisionController:
         print("=" * 60)
 
     def _emergency_motor_shutdown(self):
-        """Immediately disable all motors (from parkour)."""
+        """Immediately disable all motors - robot goes completely limp."""
         print("\n" + "!" * 70)
         print("!!! EMERGENCY STOP - L2/R2 PRESSED !!!")
         print("!" * 70)
 
-        # Send damping mode command to all motors
+        # Zero all motor forces - robot falls limp immediately
         for i in range(12):
             self.low_cmd.motor_cmd[i].mode = 0x00  # Disable motor
             self.low_cmd.motor_cmd[i].q = 0
             self.low_cmd.motor_cmd[i].dq = 0
             self.low_cmd.motor_cmd[i].kp = 0
-            self.low_cmd.motor_cmd[i].kd = 3.0  # Some damping for soft landing
+            self.low_cmd.motor_cmd[i].kd = 0  # Zero damping - completely limp
             self.low_cmd.motor_cmd[i].tau = 0
 
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
@@ -495,8 +495,7 @@ class Go2VisionController:
         self.emergency_stop = True
         self.phase = self.PHASE_EMERGENCY
         self.running = False
-        print("Motors disabled. Robot should go limp.")
-        print("CATCH THE ROBOT if needed!")
+        print("Motors DISABLED - Robot is LIMP!")
 
     def _control_loop(self):
         """Main control loop running at 500Hz."""
@@ -679,7 +678,7 @@ class Go2VisionController:
             f.write(f"  col 65:          {sample_pixels[3]:+.3f}\n")
             f.write(f"  col 86 (right):  {sample_pixels[4]:+.3f}\n")
             f.write(f"\n>>> Turn LEFT = yaw increases, LEFT depth should change\n")
-            f.write(f">>> If RIGHT changes instead, use --no_rotate_camera\n")
+            f.write(f">>> If RIGHT changes instead, use --rotate_camera\n")
 
         print(f"    Saved to: depth_imu_log.txt")
 
@@ -863,7 +862,7 @@ class Go2VisionController:
         asymmetry = left_avg - right_avg
         debug_print(f"\n  Asymmetry (left - right): {asymmetry:+.3f}")
         if abs(asymmetry) > 0.2:
-            debug_print(f"  WARNING: High asymmetry! Try --no_rotate_camera flag")
+            debug_print(f"  WARNING: High asymmetry! Try --rotate_camera flag")
 
         # Save depth image
         np.save("debug_depth.npy", depth_image)
@@ -1499,8 +1498,8 @@ def main():
                         help='Network interface for DDS')
     parser.add_argument('--skip_standup', action='store_true',
                         help='Skip sit-to-stand transition, start in standing pose (like simulator)')
-    parser.add_argument('--no_rotate_camera', action='store_true',
-                        help='Disable default 180° camera rotation')
+    parser.add_argument('--rotate_camera', action='store_true',
+                        help='Rotate camera 180° (for inverted mounting)')
     parser.add_argument('--no_torque_clip', action='store_true',
                         help='Disable torque clipping (not recommended)')
     parser.add_argument('--zero_yaw', action='store_true',
@@ -1546,12 +1545,12 @@ def main():
         target_height=DeployConfig.depth_height,
         near_clip=DeployConfig.depth_near,
         far_clip=DeployConfig.depth_far,
-        rotate_180=not args.no_rotate_camera,  # Default: rotate 180° for Go2 camera mounting
+        rotate_180=args.rotate_camera,
     )
-    print(f"✓ Camera: 640x480 → crop(L=28,R=36,T=48,B=0) → resize to {DeployConfig.depth_width}x{DeployConfig.depth_height}")
+    print(f"✓ Camera: 640x480 → crop → resize to {DeployConfig.depth_width}x{DeployConfig.depth_height}")
     print(f"  Depth range: {DeployConfig.depth_near}m - {DeployConfig.depth_far}m → normalized [-0.5, +0.5]")
-    if not args.no_rotate_camera:
-        print("✓ Camera rotation enabled (180° - default for Go2)")
+    if args.rotate_camera:
+        print("✓ Camera rotation enabled (180°)")
 
     # Setup config
     config = DeployConfig()
