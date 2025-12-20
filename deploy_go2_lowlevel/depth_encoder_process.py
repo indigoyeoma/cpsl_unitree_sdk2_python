@@ -181,7 +181,7 @@ def depth_encoder_loop(
         # Option B: Use fixed goal direction (for flat ground testing)
         # =====================================================================
 
-        USE_DEPTH_ENCODER_YAW = False  # Set True for terrain with obstacles
+        USE_DEPTH_ENCODER_YAW = True  # Use depth encoder's obstacle/terrain predictions
 
         # Fixed goal direction (used when USE_DEPTH_ENCODER_YAW = False)
         # GOAL_X: meters ahead (always positive)
