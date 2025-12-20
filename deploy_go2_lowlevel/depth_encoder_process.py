@@ -199,7 +199,15 @@ def depth_encoder_loop(
             # Output is [delta_yaw, delta_next_yaw] in RADIANS (not sin/cos!)
             # Model output is Tanh [-1,1], scale by 1.5 to get [-1.5, 1.5] radians
             yaw_pred = output[0, 32:34].numpy() * 1.5
-            shared_embedding[32] = yaw_pred[0]   # delta_yaw (radians)
+
+            # =====================================================================
+            # CALIBRATION: Measured bias correction for straight-line walking
+            # Tune this value: positive = correct left drift, negative = correct right drift
+            # Measured from flat ground test: robot drifted left with ~+0.11 rad bias
+            # =====================================================================
+            YAW_BIAS_CORRECTION = 0.11  # Subtract this from delta_yaw
+
+            shared_embedding[32] = yaw_pred[0] - YAW_BIAS_CORRECTION  # delta_yaw (radians)
             shared_embedding[33] = yaw_pred[1]   # delta_next_yaw (radians)
         else:
             # Use fixed goal direction
