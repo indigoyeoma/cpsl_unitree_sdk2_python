@@ -196,9 +196,11 @@ def depth_encoder_loop(
 
         if USE_DEPTH_ENCODER_YAW:
             # Use depth encoder's yaw prediction (for navigating terrain)
+            # Output is [delta_yaw, delta_next_yaw] in RADIANS (not sin/cos!)
+            # Model output is Tanh [-1,1], scale by 1.5 to get [-1.5, 1.5] radians
             yaw_pred = output[0, 32:34].numpy() * 1.5
-            shared_embedding[32] = -yaw_pred[0]  # delta_yaw_sin (negated)
-            shared_embedding[33] = yaw_pred[1]   # delta_yaw_cos
+            shared_embedding[32] = yaw_pred[0]   # delta_yaw (radians)
+            shared_embedding[33] = yaw_pred[1]   # delta_next_yaw (radians)
         else:
             # Use fixed goal direction
             delta_yaw = math.atan2(GOAL_Y, GOAL_X) + DRIFT_CORRECTION

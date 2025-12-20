@@ -169,16 +169,17 @@ class PolicyRunner:
         contacts_sdk = foot_contacts
 
         # Use yaw prediction from depth encoder if available
-        delta_yaw_sin = yaw_pred[0] if yaw_pred is not None else 0.0
-        delta_yaw_cos = yaw_pred[1] if yaw_pred is not None else 0.0
+        # These are delta_yaw and delta_next_yaw in RADIANS (not sin/cos!)
+        delta_yaw = yaw_pred[0] if yaw_pred is not None else 0.0
+        delta_next_yaw = yaw_pred[1] if yaw_pred is not None else 0.0
 
         # Build observation vector
         proprio = np.concatenate([
             ang_vel_scaled,                      # [3] base angular velocity
             np.array([roll, pitch]),             # [2] orientation
             np.array([0.0]),                     # [1] delta_yaw (masked with 0*)
-            np.array([delta_yaw_sin]),           # [1] delta_yaw_sin (from depth encoder)
-            np.array([delta_yaw_cos]),           # [1] delta_yaw_cos (from depth encoder)
+            np.array([delta_yaw]),               # [1] delta_yaw (radians, from depth encoder)
+            np.array([delta_next_yaw]),          # [1] delta_next_yaw (radians, from depth encoder)
             np.array([0.0, 0.0]),                # [2] commands (masked with 0*)
             np.array([cmd_vel_x]),               # [1] forward velocity command
             np.array([1.0]),                     # [1] env_class != 17
