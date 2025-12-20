@@ -201,11 +201,12 @@ def depth_encoder_loop(
             yaw_pred = output[0, 32:34].numpy() * 1.5
 
             # =====================================================================
-            # CALIBRATION: Measured bias correction for straight-line walking
-            # Tune this value: positive = correct left drift, negative = correct right drift
-            # Measured from flat ground test: robot drifted left with ~+0.11 rad bias
+            # CALIBRATION: Bias correction for straight-line walking
+            # Set to 0 initially, then tune based on observed drift:
+            #   - Robot drifts LEFT: increase this value (e.g., 0.05)
+            #   - Robot drifts RIGHT: decrease this value (e.g., -0.05)
             # =====================================================================
-            YAW_BIAS_CORRECTION = 0.11  # Subtract this from delta_yaw
+            YAW_BIAS_CORRECTION = 0.0  # Start with 0, tune if needed
 
             shared_embedding[32] = yaw_pred[0] - YAW_BIAS_CORRECTION  # delta_yaw (radians)
             shared_embedding[33] = yaw_pred[1]   # delta_next_yaw (radians)
