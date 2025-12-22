@@ -122,13 +122,18 @@ DEPTH_WIDTH = 640          # Native capture width
 DEPTH_HEIGHT = 480         # Native capture height
 DEPTH_FPS = 30             # Frame rate
 
-# Cropping (matching training go2_student_config.py)
+# Cropping
 # Training uses 160x120 intermediate with: crop_top=12, crop_bottom=0, crop_left=7, crop_right=9
-# Deployment: 640x480 -> scale crop by 4 (640/160 = 4, 480/120 = 4)
-CROP_TOP = 48              # 12 * 4 = 48 (matches training)
-CROP_BOTTOM = 0            # 0 (matches training)
-CROP_LEFT = 28             # 7 * 4 = 28 (matches training)
-CROP_RIGHT = 36            # 9 * 4 = 36 (matches training)
+# Training aspect ratio after crop: 144/108 = 1.3333
+#
+# Deployment: 640x480 - crop to center region to remove edge artifacts
+# (edges have spurious "close" readings from camera/IR interference)
+# Crop 80px from each side, then top to match training aspect ratio
+CROP_LEFT = 80             # Remove left edge artifacts
+CROP_RIGHT = 80            # Symmetric with left
+CROP_TOP = 120             # Crop top to get aspect ratio 480/360 = 1.3333
+CROP_BOTTOM = 0            # Keep bottom
+# Result: 480x360 center region -> resized to 64x48
 
 # Output resolution (matching training go2_student_config.py: resized = (64, 48))
 DEPTH_OUTPUT_WIDTH = 64
