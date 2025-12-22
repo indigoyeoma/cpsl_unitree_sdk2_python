@@ -48,6 +48,7 @@ class DepthCamera:
         # Latest frame storage (thread-safe)
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
+        self._latest_raw_frame: Optional[np.ndarray] = None  # Raw frame before preprocessing
         self._frame_timestamp: float = 0.0
 
         # Initialize filters if enabled
@@ -154,6 +155,7 @@ class DepthCamera:
                 # Store with thread safety
                 with self._frame_lock:
                     self._latest_frame = processed
+                    self._latest_raw_frame = depth_image.copy()  # Store raw frame (in mm)
                     self._frame_timestamp = time.time()
 
             except Exception as e:
@@ -234,6 +236,21 @@ class DepthCamera:
             if self._latest_frame is None:
                 return None
             return self._latest_frame.copy()
+
+    def get_raw_frame(self) -> Optional[np.ndarray]:
+        """
+        Get the latest raw depth frame (before preprocessing).
+
+        Returns:
+            Raw depth image (H, W) in millimeters, or None if no frame
+        """
+        if not HAS_REALSENSE:
+            return None
+
+        with self._frame_lock:
+            if self._latest_raw_frame is None:
+                return None
+            return self._latest_raw_frame.copy()
 
     def get_frame_age(self) -> float:
         """

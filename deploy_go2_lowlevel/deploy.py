@@ -137,6 +137,7 @@ class Go2Deployment:
         self.embedding_ready = Value(c_bool, False)
         self.proprio_ready = Value(c_bool, False)
         self.depth_encoder_stop = Value(c_bool, False)
+        self.save_depth_images = Value(c_bool, False)  # Flag to save depth images
 
         # Depth encoder process
         self.depth_encoder_process: Optional[Process] = None
@@ -256,6 +257,7 @@ class Go2Deployment:
                 self.depth_encoder_stop,
                 not self.no_camera,  # use_camera
                 self.show_depth,     # show_gui
+                self.save_depth_images,  # save_images flag
             ),
             daemon=True
         )
@@ -281,11 +283,12 @@ class Go2Deployment:
         print("Initialization complete!")
         print()
         print("Controls:")
-        print("  Y:     Stand up (from IDLE) - 2-phase like Unitree")
-        print("  B:     Sit down (from STANDING or WALKING)")
-        print("  L1:    Enable walking policy (when standing)")
-        print("  Start: Reset policy (while walking) - clears history buffer")
-        print("  R2/L2: EMERGENCY STOP")
+        print("  Y:      Stand up (from IDLE) - 2-phase like Unitree")
+        print("  B:      Sit down (from STANDING or WALKING)")
+        print("  L1:     Enable walking policy (when standing)")
+        print("  Select: Save 10 depth images (when standing)")
+        print("  Start:  Reset policy (while walking) - clears history buffer")
+        print("  R2/L2:  EMERGENCY STOP")
         print()
         print("State flow:")
         print("  IDLE --(Y)--> STANDING_UP (2-phase) --> STANDING --(L1)--> WALKING")
@@ -725,6 +728,11 @@ class Go2Deployment:
         elif self.state == State.STANDING:
             # Hold at stand position (skip torque limiting - static hold doesn't need it)
             self._send_motor_commands(DEFAULT_STAND_ANGLES_SDK, KP_STAND, KD_STAND, skip_torque_limit=True)
+
+            # Select to save depth images (for debugging)
+            if new_presses & self.WirelessButtons.select:
+                print("  [Select] Saving 10 depth images...")
+                self.save_depth_images.value = True
 
             # L1 to start walking (like parkour)
             if buttons & self.WirelessButtons.L1:

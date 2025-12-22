@@ -86,7 +86,8 @@ def depth_encoder_loop(
     proprio_ready: Value,
     should_stop: Value,
     use_camera: bool = True,
-    show_gui: bool = False
+    show_gui: bool = False,
+    save_images: Value = None
 ):
     """
     Main loop for depth encoder process.
@@ -99,6 +100,7 @@ def depth_encoder_loop(
         should_stop: Flag to stop the process
         use_camera: Whether to use real camera or dummy frames
         show_gui: Whether to display depth visualization window
+        save_images: Flag to save depth images (set by main process)
     """
     print("[DepthEncoder] Starting depth encoder process...")
 
@@ -150,9 +152,26 @@ def depth_encoder_loop(
 
     print("[DepthEncoder] Ready! Starting main loop...")
 
+    # Image saving state
+    images_to_save = 0
+    save_dir = "/home/nvidiasims/ws_go2/depth_captures"
+
     loop_count = 0
     while not should_stop.value:
         t_start = time.time()
+
+        # Check if we should start saving images
+        if save_images is not None and save_images.value and images_to_save == 0:
+            images_to_save = 10  # Save 10 images
+            save_images.value = False  # Reset flag
+            # Create save directory
+            import os
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_subdir = os.path.join(save_dir, f"capture_{timestamp}")
+            os.makedirs(save_subdir, exist_ok=True)
+            print(f"[DepthEncoder] Saving 10 depth images to {save_subdir}")
+            save_count = 0
 
         # Get depth frame
         if use_camera and camera is not None:
@@ -161,6 +180,30 @@ def depth_encoder_loop(
                 depth_frame = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
         else:
             depth_frame = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
+
+        # Save depth image if requested
+        if images_to_save > 0:
+            # Save processed frame
+            save_path = os.path.join(save_subdir, f"depth_{save_count:03d}_processed.npy")
+            np.save(save_path, depth_frame)
+
+            # Save raw frame if available
+            if camera is not None:
+                raw_frame = camera.get_raw_frame()
+                if raw_frame is not None:
+                    raw_path = os.path.join(save_subdir, f"depth_{save_count:03d}_raw.npy")
+                    np.save(raw_path, raw_frame)
+                    print(f"[DepthEncoder] Saved {save_count+1}/10: raw={raw_frame.shape} processed={depth_frame.shape}")
+                else:
+                    print(f"[DepthEncoder] Saved {save_count+1}/10: processed only (no raw)")
+            else:
+                print(f"[DepthEncoder] Saved {save_count+1}/10: processed={depth_frame.shape}")
+
+            save_count += 1
+            images_to_save -= 1
+            if images_to_save == 0:
+                print(f"[DepthEncoder] Done! Images saved to: {save_subdir}")
+            time.sleep(0.1)  # Small delay between saves
 
         # Get proprio from shared memory (written by policy process)
         proprio_np = np.array(shared_proprio[:], dtype=np.float32)
@@ -185,7 +228,7 @@ def depth_encoder_loop(
         # Option B: Use fixed goal direction (for flat ground testing)
         # =====================================================================
 
-        USE_DEPTH_ENCODER_YAW = True  # Use depth encoder's obstacle/terrain predictions
+        USE_DEPTH_ENCODER_YAW = False  # Disabled for debugging - robot walks straight
 
         # Fixed goal direction (used when USE_DEPTH_ENCODER_YAW = False)
         # GOAL_X: meters ahead (always positive)
