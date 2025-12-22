@@ -188,6 +188,17 @@ def depth_encoder_loop(
             save_path = os.path.join(save_subdir, f"depth_{save_count:03d}_processed.npy")
             np.save(save_path, depth_frame)
 
+            # Save processed frame as PNG (normalize from [-0.5, 0.5] to [0, 255])
+            try:
+                import cv2
+                # Processed is in [-0.5, 0.5], convert to [0, 255]
+                proc_normalized = ((depth_frame + 0.5) * 255).astype(np.uint8)
+                proc_colored = cv2.applyColorMap(proc_normalized, cv2.COLORMAP_VIRIDIS)
+                proc_png_path = os.path.join(save_subdir, f"depth_{save_count:03d}_processed.png")
+                cv2.imwrite(proc_png_path, proc_colored)
+            except ImportError:
+                pass  # cv2 not available, skip PNG
+
             # Save raw frame if available
             if camera is not None:
                 raw_frame = camera.get_raw_frame()
