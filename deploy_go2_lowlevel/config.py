@@ -129,11 +129,11 @@ DEPTH_FPS = 30             # Frame rate
 # Deployment: 640x480 - crop to center region to remove edge artifacts
 # (edges have spurious "close" readings from camera/IR interference)
 # Crop 80px from each side, then top to match training aspect ratio
-CROP_LEFT = 80             # Remove left edge artifacts
-CROP_RIGHT = 80            # Symmetric with left
-CROP_TOP = 120             # Crop top to get aspect ratio 480/360 = 1.3333
-CROP_BOTTOM = 0            # Keep bottom
-# Result: 480x360 center region -> resized to 64x48
+CROP_LEFT = 28             # Training crop_left=7 * 4 scale factor
+CROP_RIGHT = 36            # Training crop_right=9 * 4 scale factor
+CROP_TOP = 48              # Training crop_top=12 * 4 scale factor
+CROP_BOTTOM = 0            # Training crop_bottom=0
+# Result: Matches training FOV exactly (scale factor = 640/160 = 4)
 
 # Output resolution (matching training go2_student_config.py: resized = (64, 48))
 DEPTH_OUTPUT_WIDTH = 64
