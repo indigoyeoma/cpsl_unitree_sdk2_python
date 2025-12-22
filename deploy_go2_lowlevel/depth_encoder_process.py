@@ -154,7 +154,9 @@ def depth_encoder_loop(
 
     # Image saving state
     images_to_save = 0
-    save_dir = "/home/nvidiasims/ws_go2/depth_captures"
+    # Save to current working directory (works on robot as any user)
+    import os
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "depth_captures")
 
     loop_count = 0
     while not should_stop.value:
