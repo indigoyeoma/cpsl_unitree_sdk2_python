@@ -18,8 +18,8 @@ from config import (
 )
 
 
-class DepthOnlyFCBackbone58x87(nn.Module):
-    """CNN backbone for 58x87 depth images."""
+class DepthOnlyFCBackbone48x64(nn.Module):
+    """CNN backbone for 48x64 depth images (matches training)."""
 
     def __init__(self, num_frames: int = 1):
         super().__init__()
@@ -27,13 +27,17 @@ class DepthOnlyFCBackbone58x87(nn.Module):
         activation = nn.ELU()
 
         self.image_compression = nn.Sequential(
+            # Input: [1, 48, 64]
             nn.Conv2d(in_channels=num_frames, out_channels=32, kernel_size=5),
+            # [32, 44, 60]
             nn.MaxPool2d(kernel_size=2, stride=2),
+            # [32, 22, 30]
             activation,
             nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3),
+            # [64, 20, 28]
             activation,
             nn.Flatten(),
-            nn.Linear(64 * 25 * 39, 128),
+            nn.Linear(64 * 20 * 28, 128),
             activation,
             nn.Linear(128, 32)
         )
@@ -54,7 +58,7 @@ class SimpleDepthEncoder(nn.Module):
         activation = nn.ELU()
         last_activation = nn.Tanh()
 
-        self.base_backbone = DepthOnlyFCBackbone58x87(num_frames=1)
+        self.base_backbone = DepthOnlyFCBackbone48x64(num_frames=1)
 
         self.combination_mlp = nn.Sequential(
             nn.Linear(32 + n_proprio, 128),

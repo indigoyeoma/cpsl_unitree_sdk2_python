@@ -123,16 +123,16 @@ DEPTH_HEIGHT = 480         # Native capture height
 DEPTH_FPS = 30             # Frame rate
 
 # Cropping (matching training go2_student_config.py)
-# Training: 106x60 with crop_top=6, crop_bottom=0, crop_left=5, crop_right=6
-# Deployment: 640x480 scaled proportionally
-CROP_TOP = 48              # 6/60 * 480 = 48
+# Training uses 160x120 intermediate with: crop_top=12, crop_bottom=0, crop_left=7, crop_right=9
+# Deployment: 640x480 -> scale crop by 4 (640/160 = 4, 480/120 = 4)
+CROP_TOP = 48              # 12 * 4 = 48 (matches training)
 CROP_BOTTOM = 0            # 0 (matches training)
-CROP_LEFT = 30             # 5/106 * 640 ≈ 30
-CROP_RIGHT = 36            # 6/106 * 640 ≈ 36
+CROP_LEFT = 28             # 7 * 4 = 28 (matches training)
+CROP_RIGHT = 36            # 9 * 4 = 36 (matches training)
 
-# Output resolution (matching training)
-DEPTH_OUTPUT_WIDTH = 87
-DEPTH_OUTPUT_HEIGHT = 58
+# Output resolution (matching training go2_student_config.py: resized = (64, 48))
+DEPTH_OUTPUT_WIDTH = 64
+DEPTH_OUTPUT_HEIGHT = 48
 
 # Depth range (matching training go2_student_config.py)
 DEPTH_NEAR = 0.3           # meters (near_clip in training)
