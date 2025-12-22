@@ -184,7 +184,7 @@ def depth_encoder_loop(
 
         # Save depth image if requested
         if images_to_save > 0:
-            # Save processed frame
+            # Save processed frame (.npy)
             save_path = os.path.join(save_subdir, f"depth_{save_count:03d}_processed.npy")
             np.save(save_path, depth_frame)
 
@@ -192,8 +192,23 @@ def depth_encoder_loop(
             if camera is not None:
                 raw_frame = camera.get_raw_frame()
                 if raw_frame is not None:
+                    # Save raw as .npy
                     raw_path = os.path.join(save_subdir, f"depth_{save_count:03d}_raw.npy")
                     np.save(raw_path, raw_frame)
+
+                    # Save raw as viewable PNG (normalize to 0-255)
+                    try:
+                        import cv2
+                        # Clip to depth range and normalize to 0-255
+                        raw_clipped = np.clip(raw_frame, 300, 3000)  # 0.3m to 3m in mm
+                        raw_normalized = ((raw_clipped - 300) / 2700 * 255).astype(np.uint8)
+                        # Apply colormap for better visualization
+                        raw_colored = cv2.applyColorMap(raw_normalized, cv2.COLORMAP_VIRIDIS)
+                        png_path = os.path.join(save_subdir, f"depth_{save_count:03d}_raw.png")
+                        cv2.imwrite(png_path, raw_colored)
+                    except ImportError:
+                        pass  # cv2 not available, skip PNG
+
                     print(f"[DepthEncoder] Saved {save_count+1}/10: raw={raw_frame.shape} processed={depth_frame.shape}")
                 else:
                     print(f"[DepthEncoder] Saved {save_count+1}/10: processed only (no raw)")
