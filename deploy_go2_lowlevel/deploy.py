@@ -7,9 +7,10 @@ Architecture:
     Process 2 (spawned): Depth encoder at ~10Hz, writes embedding to shared memory
 
 Controls:
-    Y:  Stand up (from IDLE) - 2-phase interpolation like Unitree example
-    B:  Sit down (from STANDING/WALKING) - current -> sit position
-    L1: Enable walking policy (when standing)
+    Y:     Stand up (from IDLE) - 2-phase interpolation like Unitree example
+    B:     Sit down (from STANDING/WALKING) - current -> sit position
+    L1:    Enable walking policy (when standing)
+    Start: Reset policy (while walking) - clears history buffer
     R2/L2: EMERGENCY STOP - cuts all motor power
 
 Usage:
@@ -280,9 +281,10 @@ class Go2Deployment:
         print("Initialization complete!")
         print()
         print("Controls:")
-        print("  Y:  Stand up (from IDLE) - 2-phase like Unitree")
-        print("  B:  Sit down (from STANDING or WALKING)")
-        print("  L1: Enable walking policy (when standing)")
+        print("  Y:     Stand up (from IDLE) - 2-phase like Unitree")
+        print("  B:     Sit down (from STANDING or WALKING)")
+        print("  L1:    Enable walking policy (when standing)")
+        print("  Start: Reset policy (while walking) - clears history buffer")
         print("  R2/L2: EMERGENCY STOP")
         print()
         print("State flow:")
@@ -667,6 +669,8 @@ class Go2Deployment:
                 print("  [Button] A pressed", flush=True)
             if new_presses & self.WirelessButtons.B:
                 print("  [Button] B pressed", flush=True)
+            if new_presses & self.WirelessButtons.start:
+                print("  [Button] Start pressed", flush=True)
         self._last_buttons = buttons
 
         # Emergency stop takes priority - LATCHING (R2 or L2)
@@ -738,6 +742,12 @@ class Go2Deployment:
 
             # Keep torque limiting during walking for safety
             self._send_motor_commands(self.current_target, KP_WALK, KD_WALK)
+
+            # Start button to reset policy (keep walking)
+            if new_presses & self.WirelessButtons.start:
+                self.policy.reset()
+                self.policy_tick = 0
+                print("  [Start] Policy reset - continuing to walk")
 
             # B to reset policy and sit down
             if buttons & self.WirelessButtons.B:
