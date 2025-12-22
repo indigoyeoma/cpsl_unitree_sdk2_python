@@ -167,7 +167,6 @@ def depth_encoder_loop(
             images_to_save = 10  # Save 10 images
             save_images.value = False  # Reset flag
             # Create save directory
-            import os
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             save_subdir = os.path.join(save_dir, f"capture_{timestamp}")
