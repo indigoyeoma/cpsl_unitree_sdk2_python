@@ -38,4 +38,4 @@ __pycache__
 # python
 dist/
 
-*_debug
+*_debug*.pt
