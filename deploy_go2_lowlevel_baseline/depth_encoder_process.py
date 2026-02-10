@@ -194,6 +194,8 @@ def depth_encoder_loop(
     save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "depth_captures")
 
     loop_count = 0
+    last_frame_ts = 0.0
+
     while not should_stop.value:
         t_start = time.time()
 
@@ -211,11 +213,25 @@ def depth_encoder_loop(
 
         # Get depth frame
         if use_camera and camera is not None:
+            # Check if new frame is available
+            try:
+                current_ts = camera.get_timestamp()
+            except AttributeError:
+                # Fallback if get_timestamp not available yet (e.g. older version loaded)
+                current_ts = time.time()
+
+            if current_ts <= last_frame_ts and last_frame_ts > 0:
+                time.sleep(0.001)
+                continue
+            
+            last_frame_ts = current_ts
             depth_frame = camera.get_frame()
+            
             if depth_frame is None:
                 depth_frame = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
         else:
             depth_frame = np.zeros((DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH), dtype=np.float32)
+            time.sleep(0.03)  # Simulate ~30Hz in dummy mode
 
         # Save depth image if requested
         if images_to_save > 0:
@@ -332,8 +348,8 @@ def depth_encoder_loop(
         t_end = time.time()
         loop_count += 1
 
-        # Print timing periodically
-        if loop_count % 50 == 0:
+        # Print timing for every new frame
+        if True:
             total_ms = (t_end - t_start) * 1000
             inf_ms = (t_inf_end - t_inf_start) * 1000
             fps = 1.0 / (t_end - t_start) if (t_end - t_start) > 0 else 0

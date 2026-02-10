@@ -264,6 +264,16 @@ class DepthCamera:
                 return float('inf')
             return time.time() - self._frame_timestamp
 
+    def get_timestamp(self) -> float:
+        """
+        Get the timestamp of the latest frame.
+
+        Returns:
+            Timestamp of the latest frame
+        """
+        with self._frame_lock:
+            return self._frame_timestamp
+
     def _get_dummy_frame(self) -> np.ndarray:
         """Generate a dummy depth frame for testing without camera."""
         # Create a simple gradient pattern
