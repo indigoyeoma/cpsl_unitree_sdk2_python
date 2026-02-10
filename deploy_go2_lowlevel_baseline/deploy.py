@@ -837,7 +837,7 @@ class Go2Deployment:
         if self.policy_tick % 50 == 0:  # Every 50 ticks (~1 second at 50Hz)
             total_ms = (t_after_inference - t_start) * 1000
             inference_ms = (t_after_inference - t_before_inference) * 1000
-            print(f"  [Timing] tick={self.policy_tick}: total={total_ms:.1f}ms, inference={inference_ms:.1f}ms")
+            print(f"  [MLP] tick={self.policy_tick}: total={total_ms:.1f}ms, inference={inference_ms:.1f}ms")
 
         # Warn if actions are exploding (should be roughly [-2, 2] for normal walking)
         # Check against effective clip range from config (CLIP_ACTIONS / ACTION_SCALE = 1.2 / 0.25 = 4.8)

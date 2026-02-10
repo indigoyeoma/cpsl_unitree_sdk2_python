@@ -275,9 +275,11 @@ def depth_encoder_loop(
         proprio_tensor = torch.from_numpy(proprio_np).float().unsqueeze(0).to(device)
 
         # Run encoder
+        t_inf_start = time.time()
         with torch.no_grad():
             output = depth_encoder(depth_tensor, proprio_tensor)
             embedding = output[0, :128].numpy()  # First 128 dims (not yaw prediction)
+        t_inf_end = time.time()
 
         # Write to shared memory (128 depth latent + 2 yaw prediction = 130 total)
         for i in range(128):
@@ -332,8 +334,10 @@ def depth_encoder_loop(
 
         # Print timing periodically
         if loop_count % 50 == 0:
+            total_ms = (t_end - t_start) * 1000
+            inf_ms = (t_inf_end - t_inf_start) * 1000
             fps = 1.0 / (t_end - t_start) if (t_end - t_start) > 0 else 0
-            print(f"[DepthEncoder] Loop {loop_count}: {(t_end-t_start)*1000:.1f}ms ({fps:.1f} Hz)")
+            print(f"[Encoder] Loop {loop_count}: total={total_ms:.1f}ms (inf={inf_ms:.1f}ms), rate={fps:.1f} Hz")
 
         # Show depth visualization if GUI enabled
         if show_gui and cv2 is not None:
