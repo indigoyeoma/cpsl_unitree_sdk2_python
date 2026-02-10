@@ -50,7 +50,8 @@ from config import (
     DEFAULT_STAND_ANGLES_SDK, JOINT_POS_MIN, JOINT_POS_MAX,
     FIXED_VEL_X, SDK_TO_TRAIN_JOINTS,
     DEPTH_NEAR, DEPTH_FAR,
-    TORQUE_LIMITS
+    TORQUE_LIMITS,
+    CLIP_ACTIONS
 )
 from policy_runner import PolicyRunner
 from depth_encoder_process import depth_encoder_loop
