@@ -123,7 +123,8 @@ def depth_encoder_loop(
     use_camera: bool = True,
     show_gui: bool = False,
     save_images: Value = None,
-    shared_buttons: Value = None
+    shared_buttons: Value = None,
+    shared_state: Value = None
 ):
     """
     Main loop for depth encoder process.
@@ -138,6 +139,7 @@ def depth_encoder_loop(
         show_gui: Whether to display depth visualization window
         save_images: Flag to save depth images (set by main process)
         shared_buttons: Shared integer for button state (for debug printing)
+        shared_state: Shared integer for robot state (WALKING=3)
     """
     print("[DepthEncoder] Starting depth encoder process...")
 
@@ -351,11 +353,8 @@ def depth_encoder_loop(
         loop_count += 1
 
         # Print timing for every new frame BUT ONLY if L1 is pressed
-        # L1 mask is 2 (0b00000010)
-        should_print = False
-        if shared_buttons is not None:
-             if (shared_buttons.value & 2):  # L1 is pressed
-                 should_print = True
+        # Print timing for every new frame
+        should_print = True
         
         if should_print:
             total_ms = (t_end - t_start) * 1000

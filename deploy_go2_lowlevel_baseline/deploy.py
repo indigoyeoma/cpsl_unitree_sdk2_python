@@ -141,6 +141,7 @@ class Go2Deployment:
         self.depth_encoder_stop = Value(c_bool, False)
         self.save_depth_images = Value(c_bool, False)  # Flag to save depth images
         self.shared_buttons = Value(c_int, 0)  # Shared button state for debug printing
+        self.shared_state = Value(c_int, 0)    # Shared robot state (WALKING=3)
 
         # Depth encoder process
         self.depth_encoder_process: Optional[Process] = None
@@ -262,6 +263,7 @@ class Go2Deployment:
                 self.show_depth,     # show_gui
                 self.save_depth_images,  # save_images flag
                 self.shared_buttons, # shared button state
+                self.shared_state,   # shared robot state
             ),
             daemon=True
         )
@@ -663,6 +665,7 @@ class Go2Deployment:
         
         # Share button state with encoder process
         self.shared_buttons.value = buttons
+        self.shared_state.value = int(self.state)
 
         # Print button presses for convenience (only on rising edge)
         new_presses = buttons & ~self._last_buttons
