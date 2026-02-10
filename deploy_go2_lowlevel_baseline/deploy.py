@@ -839,9 +839,11 @@ class Go2Deployment:
             print(f"  [Timing] tick={self.policy_tick}: total={total_ms:.1f}ms, inference={inference_ms:.1f}ms")
 
         # Warn if actions are exploding (should be roughly [-2, 2] for normal walking)
+        # Check against effective clip range from config (CLIP_ACTIONS / ACTION_SCALE = 1.2 / 0.25 = 4.8)
+        limit = CLIP_ACTIONS / ACTION_SCALE
         action_max = np.abs(raw_actions).max()
-        if action_max > 3.0:
-            print(f"  [WARNING] tick={self.policy_tick}: Large raw actions! max={action_max:.3f}")
+        if action_max > limit:
+            print(f"  [WARNING] tick={self.policy_tick}: Large raw actions! max={action_max:.3f} > {limit:.1f}")
             print(f"    raw_actions={raw_actions}")
 
         # Get yaw prediction from shared memory for logging
@@ -882,7 +884,7 @@ class Go2Deployment:
         self.running = False
 
         if self.control_thread is not None:
-            self.control_thread.Stop()
+            self.control_thread.Wait()
 
         # Stop depth encoder process
         if self.depth_encoder_process is not None:
