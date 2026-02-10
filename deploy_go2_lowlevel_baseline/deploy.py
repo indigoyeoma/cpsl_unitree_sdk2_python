@@ -30,7 +30,7 @@ from enum import IntEnum
 from typing import Optional
 from datetime import datetime
 from multiprocessing import Process, Array, Value
-from ctypes import c_float, c_bool
+from ctypes import c_float, c_bool, c_int
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -140,6 +140,7 @@ class Go2Deployment:
         self.proprio_ready = Value(c_bool, False)
         self.depth_encoder_stop = Value(c_bool, False)
         self.save_depth_images = Value(c_bool, False)  # Flag to save depth images
+        self.shared_buttons = Value(c_int, 0)  # Shared button state for debug printing
 
         # Depth encoder process
         self.depth_encoder_process: Optional[Process] = None
@@ -260,6 +261,7 @@ class Go2Deployment:
                 not self.no_camera,  # use_camera
                 self.show_depth,     # show_gui
                 self.save_depth_images,  # save_images flag
+                self.shared_buttons, # shared button state
             ),
             daemon=True
         )
@@ -658,6 +660,9 @@ class Go2Deployment:
 
         # Get button bitmask (simple bitwise like parkour)
         buttons = self._get_buttons()
+        
+        # Share button state with encoder process
+        self.shared_buttons.value = buttons
 
         # Print button presses for convenience (only on rising edge)
         new_presses = buttons & ~self._last_buttons
