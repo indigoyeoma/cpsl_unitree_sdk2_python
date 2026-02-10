@@ -159,7 +159,7 @@ def depth_encoder_loop(
     state_dict = torch.load(VISION_WEIGHT_PATH, map_location=device)
 
     depth_encoder = SimpleDepthEncoder(n_proprio=N_PROPRIO)
-    depth_encoder.load_state_dict(state_dict['depth_encoder_state_dict'])
+    depth_encoder.load_state_dict(state_dict)
     depth_encoder.to(device)
     depth_encoder.eval()
     print("[DepthEncoder] Model loaded")
