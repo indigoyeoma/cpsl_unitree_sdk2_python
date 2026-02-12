@@ -7,12 +7,59 @@ import os
 # Add local directory to path to find ppuda if needed
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-try:
-    from depth_encoder_ghn import sample_depth_encoder_configs, build_depth_backbone, estimate_parameters
-except ImportError as e:
-    print(f"Error importing modules: {e}")
-    print("Ensure 'depth_encoder_ghn.py' and 'ppuda/' are in the same directory.")
-    sys.exit(1)
+import itertools
+from depth_encoder_ghn import DepthEncoderConfig, build_depth_backbone, estimate_parameters
+
+def generate_all_configs():
+    configs = []
+    
+    # Common settings
+    pool_positions = [0, 1]
+    fc_hidden = 128
+    activation = 'elu'
+    
+    possible_channels = [32, 64]
+    possible_kernels = [3, 5]
+    
+    # 1. 4 and 5 Layers (Full Diversity)
+    for depth in [4, 5]:
+        all_channel_combs = list(itertools.product(possible_channels, repeat=depth))
+        all_kernel_combs = list(itertools.product(possible_kernels, repeat=depth))
+        
+        for ch in all_channel_combs:
+            for k in all_kernel_combs:
+                cfg = DepthEncoderConfig(
+                    num_layers=depth,
+                    channels=list(ch),
+                    kernel_sizes=list(k),
+                    strides=[1]*depth,
+                    pool_positions=pool_positions,
+                    fc_hidden=fc_hidden,
+                    activation=activation
+                )
+                configs.append(cfg)
+
+    # 2. 6 Layers (Full Diversity now allowed!)
+    # As per user request: "if we use the 6 layres with kerenel 5 as well"
+    depth = 6
+    all_channel_combs = list(itertools.product(possible_channels, repeat=depth))
+    all_kernel_combs = list(itertools.product(possible_kernels, repeat=depth))
+    
+    for ch in all_channel_combs:
+        for k in all_kernel_combs:
+            cfg = DepthEncoderConfig(
+                num_layers=depth,
+                channels=list(ch),
+                kernel_sizes=list(k),
+                strides=[1]*depth,
+                pool_positions=pool_positions,
+                fc_hidden=fc_hidden,
+                activation=activation
+            )
+            configs.append(cfg)
+            
+    print(f"Generated {len(configs)} total unique architectures.")
+    return configs
 
 def measure_latency(model, device='cuda', input_shape=(128, 96), repeats=50):
     dummy_input = torch.randn(1, *input_shape).to(device)
@@ -52,11 +99,9 @@ def main():
         
     print(f"Profiling GHN Architectures on device: {device}")
     
-    # Sample 1000 diverse architectures using the current logic in depth_encoder_ghn.py
-    # (which implies uniform random sampling of 4-6 layers, 32-128 channels)
-    n_samples = 1000
-    print(f"Sampling {n_samples} architectures...")
-    configs = sample_depth_encoder_configs(n_samples, unique=True)
+    # Exhaustive generation
+    configs = generate_all_configs()
+    n_samples = len(configs)
     
     latencies = []
     params = []
@@ -72,7 +117,7 @@ def main():
             params.append(par)
         
         if (i+1) % 100 == 0:
-            print(f"Processed {i+1}/{len(configs)}...")
+            print(f"Processed {i+1}/{n_samples}...")
 
     latencies = np.array(latencies)
     params = np.array(params)
@@ -81,19 +126,19 @@ def main():
     print("       GHN LATENCY PROFILE (ON-DEVICE)       ")
     print("="*40)
     print(f"Device: {device}")
-    print(f"Samples: {len(latencies)}")
+    print(f"Total Unique Architectures: {len(latencies)}")
     print("-" * 40)
     print(f"Latency (ms):")
-    print(f"  Min:    {latencies.min():.4f} ms")
-    print(f"  Mean:   {latencies.mean():.4f} ms")
-    print(f"  Median: {np.median(latencies):.4f} ms")
-    print(f"  Max:    {latencies.max():.4f} ms")
+    if len(latencies) > 0:
+        print(f"  Min:    {latencies.min():.4f} ms")
+        print(f"  Mean:   {latencies.mean():.4f} ms")
+        print(f"  Median: {np.median(latencies):.4f} ms")
+        print(f"  Max:    {latencies.max():.4f} ms")
     print("-" * 40)
     print(f"Parameters (M):")
-    print(f"  Min:    {params.min()/1e6:.2f} M")
-    print(f"  Max:    {params.max()/1e6:.2f} M")
-    print("="*40)
-
+    if len(params) > 0:
+        print(f"  Min:    {params.min()/1e6:.2f} M")
+        print(f"  Max:    {params.max()/1e6:.2f} M")
     print("="*40)
 
     # Plotting (if matplotlib is available)
@@ -102,8 +147,8 @@ def main():
         print("Generating Latency vs Params plot...")
         
         plt.figure(figsize=(10, 6))
-        plt.scatter(params/1e6, latencies, alpha=0.5, c='blue')
-        plt.title(f'GHN Latency vs Parameters ({device})')
+        plt.scatter(params/1e6, latencies, alpha=0.5, c='blue', s=2)
+        plt.title(f'GHN Latency vs Parameters ({device}) - All {n_samples} Combos')
         plt.xlabel('Parameters (Millions)')
         plt.ylabel('Latency (ms)')
         plt.grid(True)

@@ -128,20 +128,24 @@ def sample_depth_encoder_config(
     kernel_options = kernel_options or [3, 5, 7]
     
     # 1. Variable Depth (4, 5, or 6 Layers)
-    # Deeper networks = more sequential compute = higher latency.
     num_layers = random.choice([4, 5, 6])
     
     # 2. Reduced Pooling for Higher Resolution (32x24)
-    # We pool early to get to 32x24, then stay there for remaining layers.
     pool_positions = [0, 1]
     
-    # 3. Diverse Channels (Heavy Compute Allowed)
-    # To reach ~1ms latency, we need wider layers on high-resolution maps.
-    possible_channels = [32, 64, 128]
+    # 3. Refined Search Space to ~5,400 Unique Architectures
+    # We restrict options to 2 choices per attribute to prevent massive explosion,
+    # but still allow significantly more diversity than before.
+    # 4 layers: (2*2)^4 = 256
+    # 5 layers: (2*2)^5 = 1024
+    # 6 layers: (2*2)^6 = 4096
+    # Total = 5,376 unique architectures.
+    
+    possible_channels = [32, 64]
+    possible_kernels = [3, 5]
+    
     channels = [random.choice(possible_channels) for _ in range(num_layers)]
-
-    # 4. Diverse Kernels
-    kernel_sizes = [random.choice([3, 5, 7]) for _ in range(num_layers)]
+    kernel_sizes = [random.choice(possible_kernels) for _ in range(num_layers)]
     
     # 5. Strides (Always 1)
     strides = [1] * num_layers
