@@ -91,6 +91,49 @@ def measure_latency(model, device='cuda', input_shape=(128, 96), repeats=50):
     avg_latency_ms = ((end - start) / repeats) * 1000
     return avg_latency_ms
 
+import torch.nn as nn
+
+# --- Copied from depth_backbone.py for standalone profiling ---
+class DepthOnlyFCBackbone128x96(nn.Module):
+    """Depth encoder backbone for 96x128 input resolution.
+    Input: [batch, 96, 128] depth image
+    Output: [batch, scandots_output_dim] latent vector (typically 32)
+    """
+    def __init__(self, prop_dim, scandots_output_dim, hidden_state_dim, output_activation=None, num_frames=1):
+        super().__init__()
+
+        self.num_frames = num_frames
+        activation = nn.ELU()
+        self.image_compression = nn.Sequential(
+            # [1, 96, 128]
+            nn.Conv2d(in_channels=self.num_frames, out_channels=32, kernel_size=5),
+            # [32, 92, 124]
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # [32, 46, 62]
+            activation,
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3),
+            # [64, 44, 60]
+            activation,
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # [64, 22, 30]
+            nn.Flatten(),
+            nn.Linear(64 * 22 * 30, 128),
+            activation,
+            nn.Linear(128, scandots_output_dim)
+        )
+
+        if output_activation == "tanh":
+            self.output_activation = nn.Tanh()
+        else:
+            self.output_activation = activation
+
+    def forward(self, images: torch.Tensor):
+        images_compressed = self.image_compression(images.unsqueeze(1))
+        latent = self.output_activation(images_compressed)
+
+        return latent
+# ----------------------------------------------------------------
+
 def main():
     if len(sys.argv) > 1:
         device = sys.argv[1]
@@ -99,6 +142,19 @@ def main():
         
     print(f"Profiling GHN Architectures on device: {device}")
     
+    # 1. Profile Static Baseline
+    print("\nProfiling Static Baseline (DepthOnlyFCBackbone128x96)...")
+    try:
+        static_model = DepthOnlyFCBackbone128x96(prop_dim=0, scandots_output_dim=32, hidden_state_dim=0)
+        static_latency = measure_latency(static_model, device)
+        static_params = sum(p.numel() for p in static_model.parameters())
+        print(f"Static Baseline: {static_latency:.4f} ms, {static_params/1e6:.2f} M params")
+    except Exception as e:
+        print(f"Failed to profile static baseline: {e}")
+        static_latency = None
+        static_params = None
+
+    # 2. Profile GHN Encoders
     # Exhaustive generation
     configs = generate_all_configs()
     n_samples = len(configs)
@@ -106,7 +162,7 @@ def main():
     latencies = []
     params = []
     
-    print("Starting profiling loop...")
+    print("\nStarting GHN profiling loop...")
     for i, cfg in enumerate(configs):
         model = build_depth_backbone(cfg)
         lat = measure_latency(model, device)
@@ -116,7 +172,7 @@ def main():
             latencies.append(lat)
             params.append(par)
         
-        if (i+1) % 100 == 0:
+        if (i+1) % 500 == 0:
             print(f"Processed {i+1}/{n_samples}...")
 
     latencies = np.array(latencies)
@@ -134,11 +190,15 @@ def main():
         print(f"  Mean:   {latencies.mean():.4f} ms")
         print(f"  Median: {np.median(latencies):.4f} ms")
         print(f"  Max:    {latencies.max():.4f} ms")
+    if static_latency:
+        print(f"  STATIC: {static_latency:.4f} ms")
     print("-" * 40)
     print(f"Parameters (M):")
     if len(params) > 0:
         print(f"  Min:    {params.min()/1e6:.2f} M")
         print(f"  Max:    {params.max()/1e6:.2f} M")
+    if static_params:
+        print(f"  STATIC: {static_params/1e6:.2f} M")
     print("="*40)
 
     # Plotting (if matplotlib is available)
@@ -147,10 +207,17 @@ def main():
         print("Generating Latency vs Params plot...")
         
         plt.figure(figsize=(10, 6))
-        plt.scatter(params/1e6, latencies, alpha=0.5, c='blue', s=2)
-        plt.title(f'GHN Latency vs Parameters ({device}) - All {n_samples} Combos')
+        # Plot GHN points
+        plt.scatter(params/1e6, latencies, alpha=0.5, c='blue', s=10, label='GHN Architectures')
+        
+        # Plot Static Baseline
+        if static_latency and static_params:
+            plt.scatter(static_params/1e6, static_latency, c='red', marker='*', s=300, label='Static Baseline')
+            
+        plt.title(f'GHN Search Space vs Static Baseline ({device})')
         plt.xlabel('Parameters (Millions)')
         plt.ylabel('Latency (ms)')
+        plt.legend()
         plt.grid(True)
         
         # Add timestamp to filename to avoid overwrites
