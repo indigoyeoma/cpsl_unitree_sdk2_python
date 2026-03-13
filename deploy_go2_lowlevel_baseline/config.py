@@ -22,9 +22,8 @@ KD_STAND = 5.0             # Standing damping (matches Unitree example)
 # =============================================================================
 # Action Scaling and Clipping (matching training)
 # =============================================================================
-ACTION_SCALE = 0.25        # Policy output scale
-CLIP_ACTIONS = 1.2         # Raw action clipping value from training
-# Effective clip range: CLIP_ACTIONS / ACTION_SCALE = 1.2 / 0.25 = 4.8
+ACTION_SCALE = 0.25        # Policy output scale (target = default + scale * action)
+CLIP_ACTIONS = 1.2         # Clip raw actions before scaling (matches training cfg.normalization.clip_actions)
 
 # =============================================================================
 # Observation Dimensions
@@ -39,7 +38,7 @@ HISTORY_LEN = 10           # History length (10 frames * 53 proprio = 530)
 N_OBS = N_PROPRIO + N_SCAN + N_PRIV_EXPLICIT + N_PRIV_LATENT + HISTORY_LEN * N_PROPRIO  # 753
 
 # Depth encoder output
-DEPTH_LATENT_DIM = 128     # Depth encoder latent dimension (MATCHES TRAINING)
+DEPTH_LATENT_DIM = 32      # Depth encoder latent dimension (scan_encoder_dims[-1]=32)
 
 # =============================================================================
 # Observation Scales (matching training)
@@ -58,11 +57,10 @@ class ObsScales:
 #                  RL_hip, RL_thigh, RL_calf, RR_hip, RR_thigh, RR_calf]
 # =============================================================================
 
-# From SDK order to Training order (for building observations)
+# SDK order  -> Training order: [FR,FL,RR,RL] -> [FL,FR,RL,RR]
+# Note: this permutation is self-inverse (applying it twice returns the original order).
 SDK_TO_TRAIN_JOINTS = [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
-
-# From Training order to SDK order (for applying actions)
-TRAIN_TO_SDK_JOINTS = [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]  # Same mapping
+TRAIN_TO_SDK_JOINTS = SDK_TO_TRAIN_JOINTS  # same permutation is its own inverse
 
 # Feet ordering: SDK [FR, FL, RR, RL] -> Training [FL, FR, RL, RR]
 SDK_TO_TRAIN_FEET = [1, 0, 3, 2]
@@ -135,13 +133,13 @@ CROP_TOP = 48              # Training crop_top=12 * 4 scale factor
 CROP_BOTTOM = 0            # Training crop_bottom=0
 # Result: Matches training FOV exactly (scale factor = 640/160 = 4)
 
-# Output resolution (matching training go2_student_config.py: resized = (128, 96))
-DEPTH_OUTPUT_WIDTH = 128
-DEPTH_OUTPUT_HEIGHT = 96
+# Output resolution (matching training go2_student_config.py: resized = (87, 58))
+DEPTH_OUTPUT_WIDTH = 87
+DEPTH_OUTPUT_HEIGHT = 58
 
-# Depth range (matching training go2_student_config.py)
-DEPTH_NEAR = 0.3           # meters (near_clip in training)
-DEPTH_FAR = 3.0            # meters (far_clip in training)
+# Depth range (matching training go2_student_config.py: near_clip=0, far_clip=2)
+DEPTH_NEAR = 0.0           # meters (near_clip in training)
+DEPTH_FAR = 2.0            # meters (far_clip in training)
 
 # =============================================================================
 # Fixed Velocity Command
@@ -162,5 +160,5 @@ SIT_DOWN_DURATION = 1.0    # seconds to interpolate to sit
 import os
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(_THIS_DIR, "policy")
-BASE_JIT_PATH = os.path.join(MODEL_DIR, "student_static-19000-base_jit.pt")
-VISION_WEIGHT_PATH = os.path.join(MODEL_DIR, "student_static-19000-vision_weight.pt")
+BASE_JIT_PATH = os.path.join(MODEL_DIR, "test_student-20500-base_jit.pt")
+VISION_WEIGHT_PATH = os.path.join(MODEL_DIR, "test_student-20500-vision_weight.pt")

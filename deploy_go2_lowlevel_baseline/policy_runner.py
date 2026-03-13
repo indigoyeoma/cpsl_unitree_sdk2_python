@@ -130,9 +130,9 @@ class PolicyRunner:
         return self._cached_depth_latent.copy()
 
     def get_yaw_pred_from_shared(self) -> np.ndarray:
-        """Read yaw prediction from shared memory (indices 32-33, written by depth encoder)."""
-        self._cached_yaw_pred[0] = self.shared_embedding[32]  # delta_yaw_sin
-        self._cached_yaw_pred[1] = self.shared_embedding[33]  # delta_yaw_cos
+        """Read yaw prediction from shared memory (written by depth encoder after depth latent)."""
+        self._cached_yaw_pred[0] = self.shared_embedding[DEPTH_LATENT_DIM]
+        self._cached_yaw_pred[1] = self.shared_embedding[DEPTH_LATENT_DIM + 1]
         return self._cached_yaw_pred.copy()
 
     def write_proprio_to_shared(self, proprio: np.ndarray):
@@ -155,7 +155,7 @@ class PolicyRunner:
         Build the proprioceptive observation vector.
 
         Args:
-            yaw_pred: Yaw prediction from depth encoder [delta_yaw_sin, delta_yaw_cos]
+            yaw_pred: Yaw prediction from depth encoder [delta_yaw, delta_next_yaw] in radians.
                       If None, uses zeros.
 
         Returns:
@@ -257,9 +257,8 @@ class PolicyRunner:
         # Store RAW actions for next step
         self.last_actions = actions_raw.copy()
 
-        # Clip actions before scaling
-        effective_clip = CLIP_ACTIONS / ACTION_SCALE  # = 4.8
-        actions_clipped = np.clip(actions_raw, -effective_clip, effective_clip)
+        # Clip raw actions then scale to joint targets (matches training pipeline)
+        actions_clipped = np.clip(actions_raw, -CLIP_ACTIONS, CLIP_ACTIONS)
 
         # Convert to joint targets
         targets_sdk = actions_clipped * ACTION_SCALE + DEFAULT_STAND_ANGLES_SDK
@@ -298,7 +297,7 @@ class PolicyRunner:
         # Debug: print yaw prediction periodically
         self._inference_count = getattr(self, '_inference_count', 0) + 1
         if self._inference_count % 50 == 1:
-            print(f"  [YawPred] sin={yaw_pred[0]:.4f}, cos={yaw_pred[1]:.4f}")
+            print(f"  [YawPred] delta_yaw={yaw_pred[0]:+.4f} rad, delta_next_yaw={yaw_pred[1]:+.4f} rad")
 
         # Build proprioceptive observation with yaw prediction
         proprio = self.build_proprio_obs(

@@ -50,8 +50,8 @@ from config import (
     DEFAULT_STAND_ANGLES_SDK, JOINT_POS_MIN, JOINT_POS_MAX,
     FIXED_VEL_X, SDK_TO_TRAIN_JOINTS,
     DEPTH_NEAR, DEPTH_FAR,
-    TORQUE_LIMITS,
-    CLIP_ACTIONS
+    TORQUE_LIMITS, CLIP_ACTIONS,
+    DEPTH_OUTPUT_WIDTH, DEPTH_OUTPUT_HEIGHT
 )
 from policy_runner import PolicyRunner
 from depth_encoder_process import depth_encoder_loop
@@ -132,9 +132,8 @@ class Go2Deployment:
         self._last_buttons = 0
 
         # Shared memory for two-process architecture
-        # Shared memory for depth embeddings (128 latent + 2 yaw)
-        # Using 130 floats instead of 34
-        self.shared_embedding = Array(c_float, 130)  # Depth latent + yaw from encoder
+        # Shared memory for depth embeddings (32 latent + 2 yaw = 34 total)
+        self.shared_embedding = Array(c_float, 34)  # Depth latent + yaw from encoder
         self.shared_proprio = Array(c_float, N_PROPRIO)  # Proprio for encoder
         self.embedding_ready = Value(c_bool, False)
         self.proprio_ready = Value(c_bool, False)
@@ -179,9 +178,12 @@ class Go2Deployment:
             self.low_cmd.motor_cmd[i].kd = 0
             self.low_cmd.motor_cmd[i].tau = 0
 
-    def init(self) -> bool:
+    def init(self, interface: str = None) -> bool:
         """
         Initialize all components.
+
+        Args:
+            interface: Optional network interface for DDS (e.g., "eth0")
 
         Returns:
             True if successful
@@ -192,6 +194,9 @@ class Go2Deployment:
         print(f"Mode: {'DRYRUN' if self.dryrun else 'LIVE'}")
         print(f"Camera: {'DISABLED' if self.no_camera else 'ENABLED'}")
         print(f"Depth GUI: {'ENABLED' if self.show_depth else 'DISABLED'}")
+        print(f"Depth size: {DEPTH_OUTPUT_HEIGHT}x{DEPTH_OUTPUT_WIDTH}, "
+              f"range: [{DEPTH_NEAR:.1f}m, {DEPTH_FAR:.1f}m]")
+        print(f"Depth latent dim: {DEPTH_LATENT_DIM}")
         print()
 
         # Initialize command structure
@@ -200,7 +205,10 @@ class Go2Deployment:
         # Initialize DDS communication
         print("Initializing DDS communication...")
         try:
-            ChannelFactoryInitialize(0)
+            if interface:
+                ChannelFactoryInitialize(0, interface)
+            else:
+                ChannelFactoryInitialize(0)
         except Exception as e:
             print(f"Failed to initialize DDS: {e}")
             return False
@@ -418,20 +426,22 @@ class Go2Deployment:
         self.log_file.write(f"  raw=0x{buttons_raw:04X}\n")
         self.log_file.write(f"  Y={bool(buttons_raw & self.WirelessButtons.Y)}, L1={bool(buttons_raw & self.WirelessButtons.L1)}, R2={bool(buttons_raw & self.WirelessButtons.R2)}\n")
 
-        # Depth stats
+        # Depth embedding stats
         if depth_stats:
-            self.log_file.write(f"\n[Depth Image]\n")
-            self.log_file.write(f"  min={depth_stats['min']:.4f}, max={depth_stats['max']:.4f}, mean={depth_stats['mean']:.4f}\n")
-            self.log_file.write(f"  (Expected range: [-0.5, 0.5])\n")
+            self.log_file.write(f"\n[Depth Embedding]\n")
+            if 'norm' in depth_stats:
+                self.log_file.write(f"  latent_norm={depth_stats['norm']:.4f} (dim={DEPTH_LATENT_DIM})\n")
+            if 'min' in depth_stats:
+                self.log_file.write(f"  image: min={depth_stats['min']:.4f}, max={depth_stats['max']:.4f}, "
+                                    f"mean={depth_stats['mean']:.4f} (range [-0.5, 0.5])\n")
 
         # Extra debug info (raw actions, etc.)
         if extra_debug:
             # Yaw prediction from depth encoder
-            if 'yaw_pred_sin' in extra_debug and 'yaw_pred_cos' in extra_debug:
-                yaw_sin = extra_debug['yaw_pred_sin']
-                yaw_cos = extra_debug['yaw_pred_cos']
-                self.log_file.write(f"\n[Yaw Prediction (from depth encoder)]\n")
-                self.log_file.write(f"  sin={yaw_sin:+.4f}, cos={yaw_cos:+.4f}\n")
+            if 'delta_yaw' in extra_debug:
+                self.log_file.write(f"\n[Yaw Prediction (from depth encoder, radians)]\n")
+                self.log_file.write(f"  delta_yaw={extra_debug['delta_yaw']:+.4f} rad, "
+                                    f"delta_next_yaw={extra_debug.get('delta_next_yaw', 0.0):+.4f} rad\n")
 
             if extra_debug.get('last_actions') is not None:
                 actions = extra_debug['last_actions']
@@ -847,17 +857,19 @@ class Go2Deployment:
             inference_ms = (t_after_inference - t_before_inference) * 1000
             print(f"  [MLP] tick={self.policy_tick}: total={total_ms:.1f}ms, inference={inference_ms:.1f}ms")
 
-        # Warn if actions are exploding (should be roughly [-2, 2] for normal walking)
-        # Check against effective clip range from config (CLIP_ACTIONS / ACTION_SCALE = 1.2 / 0.25 = 4.8)
-        limit = CLIP_ACTIONS / ACTION_SCALE
+        # Warn if raw actions are hitting the clip limit (policy is saturating)
         action_max = np.abs(raw_actions).max()
-        if action_max > limit:
-            print(f"  [WARNING] tick={self.policy_tick}: Large raw actions! max={action_max:.3f} > {limit:.1f}")
-            print(f"    raw_actions={raw_actions}")
+        if action_max > CLIP_ACTIONS * 0.9:
+            print(f"  [WARNING] tick={self.policy_tick}: Actions near clip limit! "
+                  f"max={action_max:.3f} (clip={CLIP_ACTIONS})")
 
         # Get yaw prediction from shared memory for logging
-        yaw_pred_sin = float(self.shared_embedding[32])
-        yaw_pred_cos = float(self.shared_embedding[33])
+        delta_yaw = float(self.shared_embedding[DEPTH_LATENT_DIM])
+        delta_next_yaw = float(self.shared_embedding[DEPTH_LATENT_DIM + 1])
+
+        # Compute depth embedding norm for logging (rough signal quality indicator)
+        depth_latent = [self.shared_embedding[i] for i in range(DEPTH_LATENT_DIM)]
+        depth_embedding_norm = float(np.linalg.norm(depth_latent))
 
         # Log comprehensive data for debugging (depth is in separate process now)
         extra_debug = {
@@ -869,10 +881,14 @@ class Go2Deployment:
             'foot_contacts': foot_contacts.tolist(),
             'last_actions': self.policy.last_actions.tolist() if self.policy else None,
             'raw_actions': raw_actions.tolist(),
-            'yaw_pred_sin': yaw_pred_sin,
-            'yaw_pred_cos': yaw_pred_cos,
+            'delta_yaw': delta_yaw,
+            'delta_next_yaw': delta_next_yaw,
         }
-        self._log_sensor_data(depth_stats=None, policy_output=targets, extra_debug=extra_debug)
+        if self.policy_tick % 50 == 0:
+            print(f"  [Depth] embedding_norm={depth_embedding_norm:.3f}, "
+                  f"delta_yaw={delta_yaw:+.3f} rad")
+        depth_stats = {'norm': depth_embedding_norm}
+        self._log_sensor_data(depth_stats=depth_stats, policy_output=targets, extra_debug=extra_debug)
 
         return targets
 
@@ -922,17 +938,13 @@ def main():
                         help="Network interface (e.g., eth0)")
     args = parser.parse_args()
 
-    # Initialize DDS with network interface if specified
-    if args.interface:
-        ChannelFactoryInitialize(0, args.interface)
-
     deployment = Go2Deployment(
         dryrun=args.dryrun,
         no_camera=args.no_camera,
         show_depth=args.show_depth
     )
 
-    if not deployment.init():
+    if not deployment.init(interface=args.interface):
         print("Initialization failed")
         sys.exit(1)
 
