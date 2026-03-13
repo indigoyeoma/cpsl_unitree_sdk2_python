@@ -30,7 +30,7 @@ from enum import IntEnum
 from typing import Optional
 from datetime import datetime
 from multiprocessing import Process, Array, Value
-from ctypes import c_float, c_bool, c_int
+from ctypes import c_float, c_bool
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -139,8 +139,6 @@ class Go2Deployment:
         self.proprio_ready = Value(c_bool, False)
         self.depth_encoder_stop = Value(c_bool, False)
         self.save_depth_images = Value(c_bool, False)  # Flag to save depth images
-        self.shared_buttons = Value(c_int, 0)  # Shared button state for debug printing
-        self.shared_state = Value(c_int, 0)    # Shared robot state (WALKING=3)
 
         # Depth encoder process
         self.depth_encoder_process: Optional[Process] = None
@@ -156,11 +154,8 @@ class Go2Deployment:
         self.running = False
         self.control_thread = None
 
-        # Logging (enabled for both dryrun and normal mode)
+        # Logging (written at policy rate ~50Hz, to file only)
         self.log_file = None
-        self.log_interval = 50  # Log every 50 ticks (10Hz at 500Hz loop)
-        self.last_depth_stats = {}
-        self.last_policy_output = None
         self.log_start_time = time.time()
 
     def init_low_cmd(self):
@@ -267,11 +262,9 @@ class Go2Deployment:
                 self.embedding_ready,
                 self.proprio_ready,
                 self.depth_encoder_stop,
-                not self.no_camera,  # use_camera
-                self.show_depth,     # show_gui
+                not self.no_camera,      # use_camera
+                self.show_depth,         # show_gui
                 self.save_depth_images,  # save_images flag
-                self.shared_buttons, # shared button state
-                self.shared_state,   # shared robot state
             ),
             daemon=True
         )
@@ -670,12 +663,8 @@ class Go2Deployment:
 
         self.tick += 1
 
-        # Get button bitmask (simple bitwise like parkour)
+        # Get button bitmask
         buttons = self._get_buttons()
-        
-        # Share button state with encoder process
-        self.shared_buttons.value = buttons
-        self.shared_state.value = int(self.state)
 
         # Print button presses for convenience (only on rising edge)
         new_presses = buttons & ~self._last_buttons

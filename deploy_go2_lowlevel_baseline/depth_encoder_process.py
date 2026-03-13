@@ -111,23 +111,21 @@ def depth_encoder_loop(
     use_camera: bool = True,
     show_gui: bool = False,
     save_images: Value = None,
-    shared_buttons: Value = None,
-    shared_state: Value = None
 ):
     """
     Main loop for depth encoder process.
 
     Args:
-        shared_embedding: Shared array for 34-dim output (32 depth latent + 2 yaw)
-        shared_proprio: Shared array for N_PROPRIO proprio input from policy
-        embedding_ready: Flag indicating new embedding is available
-        proprio_ready: Flag indicating new proprio is available
-        should_stop: Flag to stop the process
-        use_camera: Whether to use real camera or dummy frames
-        show_gui: Whether to display depth visualization window
-        save_images: Flag to save depth images (set by main process)
-        shared_buttons: Shared integer for button state (for debug printing)
-        shared_state: Shared integer for robot state (WALKING=3)
+        shared_embedding: Shared array for (DEPTH_LATENT_DIM + 2) floats
+                          [0:DEPTH_LATENT_DIM] = depth latent,
+                          [DEPTH_LATENT_DIM:] = (delta_yaw, delta_next_yaw)
+        shared_proprio: Shared array for N_PROPRIO proprio input (written by policy process)
+        embedding_ready: Flag set True each time a new embedding is written
+        proprio_ready: Flag set True when proprio is valid (unused currently)
+        should_stop: Set True to terminate the loop
+        use_camera: Whether to use real RealSense camera or dummy zero frames
+        show_gui: Whether to show a live depth visualization window (requires cv2)
+        save_images: Optional flag; set True from main process to trigger saving 10 frames
     """
     print("[DepthEncoder] Starting depth encoder process...")
 
@@ -309,10 +307,12 @@ def depth_encoder_loop(
         t_end = time.time()
         loop_count += 1
 
-        total_ms = (t_end - t_start) * 1000
-        inf_ms = (t_inf_end - t_inf_start) * 1000
-        fps = 1.0 / (t_end - t_start) if (t_end - t_start) > 0 else 0
-        print(f"[Encoder] Loop {loop_count}: total={total_ms:.1f}ms (inf={inf_ms:.1f}ms), rate={fps:.1f} Hz")
+        # Print timing every 50 loops (~5 seconds at 10Hz)
+        if loop_count % 50 == 0:
+            total_ms = (t_end - t_start) * 1000
+            inf_ms = (t_inf_end - t_inf_start) * 1000
+            fps = 1.0 / (t_end - t_start) if (t_end - t_start) > 0 else 0
+            print(f"[Encoder] Loop {loop_count}: total={total_ms:.1f}ms (inf={inf_ms:.1f}ms), rate={fps:.1f} Hz")
 
         # Show depth visualization if GUI enabled
         if show_gui and cv2 is not None:
