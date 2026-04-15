@@ -17,9 +17,11 @@ Metrics per model:
 Usage:  python testing/compare_dp_models.py
 """
 
+import contextlib
 import gc
 import math
 import statistics
+import threading
 import time
 
 import torch
@@ -38,7 +40,7 @@ BASELINE_CFG = dict(
     cond_dim=45,
     depth_latent_dim=32,
     num_tasks=5,
-    n_layer=8,
+    n_layer=12,
     n_head=8,
     n_emb=384,
     p_drop_emb=0.0,
@@ -227,11 +229,12 @@ class TransformerForDiffusionWithDepth(ModuleAttrMixin):
                 nn.Linear(n_emb, 4 * n_emb), nn.Mish(),
                 nn.Linear(4 * n_emb, n_emb))
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=n_emb, nhead=n_head, dim_feedforward=4 * n_emb,
-            dropout=p_drop_attn, activation="gelu",
-            batch_first=True, norm_first=True)
-        self.decoder = nn.TransformerDecoder(decoder_layer=decoder_layer, num_layers=n_layer)
+        self.decoder = nn.ModuleList([
+            nn.TransformerDecoderLayer(
+                d_model=n_emb, nhead=n_head, dim_feedforward=4 * n_emb,
+                dropout=p_drop_attn, activation="gelu",
+                batch_first=True, norm_first=True)
+            for _ in range(n_layer)])
 
         self.ln_f = nn.LayerNorm(n_emb)
         self.head = nn.Linear(n_emb, output_dim)
@@ -301,7 +304,8 @@ class TransformerForDiffusionWithDepth(ModuleAttrMixin):
         t = sample.shape[1]
         token_embeddings = self.input_emb(sample)
         x = self.drop(token_embeddings + self.pos_emb[:, :t, :])
-        x = self.decoder(tgt=x, memory=memory, tgt_mask=self.mask, memory_mask=self.memory_mask)
+        for layer in self.decoder:
+            x = layer(tgt=x, memory=memory, tgt_mask=self.mask, memory_mask=self.memory_mask)
 
         x = self.ln_f(x)
         return self.head(x)
@@ -398,23 +402,51 @@ class MultiskillForward(nn.Module):
                           depth=depth, task_id=task_id, tau=None)
 
 
-def count_params(model):
+def count_params(model, kind="baseline"):
     total = sum(p.numel() for p in model.parameters())
     trainable_no_depth = sum(
         p.numel() for name, p in model.named_parameters()
         if not name.startswith("depth_backbone."))
-    return total, trainable_no_depth
+    if kind == "multiskill":
+        # Active = stored minus the (num_skills-1) idle task_mlps per decoder layer
+        idle_per_layer = sum(
+            p.numel()
+            for layer in model.decoder
+            for p in layer.skill_ffn.task_mlps[1].parameters()  # one idle skill size
+        ) * (model.num_skills - 1)
+        total_active = total - idle_per_layer
+        trainable_no_depth_active = trainable_no_depth - idle_per_layer
+    else:
+        total_active = total
+        trainable_no_depth_active = trainable_no_depth
+    return total, trainable_no_depth, total_active, trainable_no_depth_active
 
 
 def count_decoder_ffn_params(model, kind):
+    """Stored FFN params (all skill MLPs for multiskill)."""
     n = 0
     if kind == "baseline":
-        for layer in model.decoder.layers:
+        for layer in model.decoder:
             n += sum(p.numel() for p in layer.linear1.parameters())
             n += sum(p.numel() for p in layer.linear2.parameters())
     else:
         for layer in model.decoder:
             n += sum(p.numel() for p in layer.skill_ffn.parameters())
+    return n
+
+
+def count_decoder_ffn_active_params(model, kind):
+    """Active FFN params at inference (base_mlp + 1 task_mlp for multiskill)."""
+    n = 0
+    if kind == "baseline":
+        for layer in model.decoder:
+            n += sum(p.numel() for p in layer.linear1.parameters())
+            n += sum(p.numel() for p in layer.linear2.parameters())
+    else:
+        for layer in model.decoder:
+            ffn = layer.skill_ffn
+            n += sum(p.numel() for p in ffn.base_mlp.parameters())
+            n += sum(p.numel() for p in ffn.task_mlps[0].parameters())  # one skill
     return n
 
 
@@ -444,6 +476,69 @@ def _cuda_sync(device):
         torch.cuda.synchronize(device)
 
 
+# ============================================================================
+# Async depth worker — simulates the deployment setup where the depth
+# encoder runs on its own thread (separate CUDA stream on GPU) while the
+# actor/diffusion policy runs. This creates realistic resource contention
+# for latency measurement.
+# ============================================================================
+class AsyncDepthWorker:
+    """Runs a standalone DepthOnlyFCBackbone58x87 in a background thread.
+
+    On CUDA: uses a separate CUDA stream so it truly overlaps with the
+    actor's default-stream compute (same GPU, shared SMs/memory BW).
+    On CPU: runs as a regular Python thread (GIL will serialize pure-Python
+    but PyTorch ops release the GIL, so BLAS work overlaps).
+    """
+
+    def __init__(self, device, depth_latent_dim=32, sleep_s=0.0):
+        self.device = device
+        self.sleep_s = sleep_s
+        self.model = DepthOnlyFCBackbone58x87(
+            scandots_output_dim=depth_latent_dim).to(device).eval()
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self._dummy = torch.randn(1, 58, 87, device=device)
+        self._stop = threading.Event()
+        self._thread = None
+        self._stream = (torch.cuda.Stream(device=device)
+                        if device.type == "cuda" else None)
+        self.forward_count = 0
+
+    def _run(self):
+        ctx = (torch.cuda.stream(self._stream)
+               if self._stream is not None else contextlib.nullcontext())
+        with torch.no_grad(), ctx:
+            while not self._stop.is_set():
+                _ = self.model(self._dummy)
+                self.forward_count += 1
+                if self.sleep_s > 0:
+                    time.sleep(self.sleep_s)
+
+    def start(self):
+        self._stop.clear()
+        self.forward_count = 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+
+
+@contextlib.contextmanager
+def async_depth_contention(device):
+    """Context manager: spins up an async depth worker for the scoped block."""
+    worker = AsyncDepthWorker(device)
+    worker.start()
+    try:
+        yield worker
+    finally:
+        worker.stop()
+
+
 def time_single_forward(forward_module, inputs, device, warmup=10, iters=50):
     forward_module.eval()
     with torch.no_grad():
@@ -460,7 +555,15 @@ def time_single_forward(forward_module, inputs, device, warmup=10, iters=50):
     return statistics.mean(times_ms), (statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0)
 
 
-def time_ddpm_loop(forward_module, inputs, scheduler, device, warmup=5, iters=20):
+def time_ddpm_loop(forward_module, inputs, scheduler, device,
+                   warmup=5, iters=20, async_depth=False):
+    """Time the full NUM_INFERENCE_STEPS DDPM loop.
+
+    If async_depth=True, a background DepthOnlyFCBackbone58x87 runs in a
+    separate thread (separate CUDA stream on GPU) throughout the measurement,
+    simulating the deployment layout where depth encoding is asynchronous
+    with the actor/diffusion policy.
+    """
     forward_module.eval()
     scheduler.set_timesteps(NUM_INFERENCE_STEPS)
     sample_shape = inputs["sample"].shape
@@ -475,7 +578,13 @@ def time_ddpm_loop(forward_module, inputs, scheduler, device, warmup=5, iters=20
             trajectory = scheduler.step(out, t, trajectory).prev_sample
         return trajectory
 
-    with torch.no_grad():
+    worker_ctx = (async_depth_contention(device)
+                  if async_depth else contextlib.nullcontext())
+
+    with torch.no_grad(), worker_ctx as worker:
+        # Let the depth worker warm up its stream / caches before timing.
+        if worker is not None:
+            time.sleep(0.2)
         for _ in range(warmup):
             run_loop()
         _cuda_sync(device)
@@ -486,7 +595,13 @@ def time_ddpm_loop(forward_module, inputs, scheduler, device, warmup=5, iters=20
             run_loop()
             _cuda_sync(device)
             times_ms.append((time.perf_counter() - t0) * 1000.0)
-    return statistics.mean(times_ms), (statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0)
+        depth_hz = None
+        if worker is not None and len(times_ms) > 0:
+            total_s = sum(times_ms) / 1000.0
+            depth_hz = worker.forward_count / total_s if total_s > 0 else None
+    mean_ms = statistics.mean(times_ms)
+    std_ms = statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0
+    return mean_ms, std_ms, depth_hz
 
 
 # ============================================================================
@@ -505,17 +620,25 @@ def measure_variant(label, model, kind, device):
         y = wrapped(**inputs)
     assert y.shape == (BATCH, BASELINE_CFG["horizon"], BASELINE_CFG["input_dim"])
 
-    total, trainable_no_depth = count_params(model)
-    ffn_params = count_decoder_ffn_params(model, kind)
-    flops_single, backend = measure_flops(wrapped, inputs)
-    flops_loop = flops_single * NUM_INFERENCE_STEPS if flops_single is not None else None
-
-    single_mean, single_std = time_single_forward(wrapped, inputs, device)
+    total, trainable_no_depth, total_active, trainable_no_depth_active = count_params(model, kind)
+    flops_loop, backend = measure_flops(wrapped, inputs)
+    if flops_loop is not None:
+        flops_loop *= NUM_INFERENCE_STEPS
 
     from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
     scheduler = DDPMScheduler(**NOISE_SCHEDULER_CFG)
-    loop_mean, loop_std = time_ddpm_loop(wrapped, inputs, scheduler, device)
+
+    # Solo run — no depth contention.
+    loop_mean, loop_std, _ = time_ddpm_loop(
+        wrapped, inputs, scheduler, device, async_depth=False)
     throughput_hz = 1000.0 / loop_mean if loop_mean > 0 else float("nan")
+
+    # Async-depth run — a standalone DepthOnlyFCBackbone58x87 runs in a
+    # background thread/stream, mirroring the deployment setup.
+    loop_mean_async, loop_std_async, depth_hz = time_ddpm_loop(
+        wrapped, inputs, scheduler, device, async_depth=True)
+    throughput_hz_async = (1000.0 / loop_mean_async
+                           if loop_mean_async > 0 else float("nan"))
 
     del wrapped, model, scheduler
     gc.collect()
@@ -525,16 +648,18 @@ def measure_variant(label, model, kind, device):
     return dict(
         label=label,
         total_params=total,
+        total_active=total_active,
         trainable_no_depth=trainable_no_depth,
-        ffn_params=ffn_params,
-        flops_single=flops_single,
+        trainable_no_depth_active=trainable_no_depth_active,
         flops_loop=flops_loop,
         flops_backend=backend,
-        single_mean_ms=single_mean,
-        single_std_ms=single_std,
         loop_mean_ms=loop_mean,
         loop_std_ms=loop_std,
         throughput_hz=throughput_hz,
+        loop_mean_ms_async=loop_mean_async,
+        loop_std_ms_async=loop_std_async,
+        throughput_hz_async=throughput_hz_async,
+        depth_worker_hz=depth_hz,
     )
 
 
@@ -574,24 +699,29 @@ def print_comparison(results):
         return [""] + [fmt_ratio(r[key], base[key]) for r in results[1:]]
 
     rows = [
-        ("Total params",
+        ("Total params (stored)",
          [fmt_params(r["total_params"]) for r in results], ratios("total_params")),
-        ("Trainable (no depth)",
+        ("Total params (active)",
+         [fmt_params(r["total_active"]) for r in results], ratios("total_active")),
+        ("Trainable no-depth (stored)",
          [fmt_params(r["trainable_no_depth"]) for r in results], ratios("trainable_no_depth")),
-        ("Decoder FFN params",
-         [fmt_params(r["ffn_params"]) for r in results], ratios("ffn_params")),
-        ("FLOPs / single fwd",
-         [fmt_flops(r["flops_single"]) for r in results], ratios("flops_single")),
+        ("Trainable no-depth (active)",
+         [fmt_params(r["trainable_no_depth_active"]) for r in results], ratios("trainable_no_depth_active")),
         ("FLOPs / 10-step loop",
          [fmt_flops(r["flops_loop"]) for r in results], ratios("flops_loop")),
-        ("Latency single fwd (ms)",
-         [f"{r['single_mean_ms']:.2f} ± {r['single_std_ms']:.2f}" for r in results],
-         ratios("single_mean_ms")),
-        ("Latency 10-step loop (ms)",
+        ("Latency 10-step loop (ms, solo)",
          [f"{r['loop_mean_ms']:.2f} ± {r['loop_std_ms']:.2f}" for r in results],
          ratios("loop_mean_ms")),
-        ("Throughput (Hz, full loop)",
+        ("Latency 10-step loop (ms, +async depth)",
+         [f"{r['loop_mean_ms_async']:.2f} ± {r['loop_std_ms_async']:.2f}" for r in results],
+         ratios("loop_mean_ms_async")),
+        ("Throughput solo (Hz)",
          [f"{r['throughput_hz']:.1f}" for r in results], ratios("throughput_hz")),
+        ("Throughput +async depth (Hz)",
+         [f"{r['throughput_hz_async']:.1f}" for r in results], ratios("throughput_hz_async")),
+        ("Async depth worker rate (Hz)",
+         [(f"{r['depth_worker_hz']:.1f}" if r['depth_worker_hz'] else "N/A")
+          for r in results], [""] * len(results)),
     ]
 
     col_w = 22
@@ -626,16 +756,16 @@ def main():
         device = torch.device("cpu")
         print("Device: cpu (CUDA not available)")
 
-    # 1. Baseline
+    n_emb = BASELINE_CFG["n_emb"]
+
+    # ── Eager (no compile) ──────────────────────────────────────────────────
     baseline = TransformerForDiffusionWithDepth(**BASELINE_CFG).to(device).eval()
     r_base = measure_variant("baseline_dp", baseline, "baseline", device)
 
-    # 2. Multiskill, task_dim = 384
     mcfg_384 = dict(MULTISKILL_CFG)
     msk_384 = TransformerForDiffusionWithDepthSkillFFN(**mcfg_384).to(device).eval()
     r_msk_384 = measure_variant("multiskill (t=384)", msk_384, "multiskill", device)
 
-    # 3. Multiskill, task_dim = 128
     mcfg_128 = dict(MULTISKILL_CFG, task_dim=128)
     msk_128 = TransformerForDiffusionWithDepthSkillFFN(**mcfg_128).to(device).eval()
     r_msk_128 = measure_variant("multiskill (t=128)", msk_128, "multiskill", device)
@@ -644,9 +774,9 @@ def main():
 
     # Summary of FFN deltas
     print("\n  Active FFN hidden (per decoder layer, at inference):")
-    print(f"    baseline_dp        : 4 × 384 = 1536")
-    print(f"    multiskill (t=384) : base(384) + task(384) =  768   (half of baseline)")
-    print(f"    multiskill (t=128) : base(384) + task(128) =  512   (~1/3 of baseline)")
+    print(f"    baseline_dp        : 4 × {n_emb} = {4 * n_emb}")
+    print(f"    multiskill (t=384) : base({n_emb}) + task(384) = {n_emb + 384}   (half of baseline)")
+    print(f"    multiskill (t=128) : base({n_emb}) + task(128) = {n_emb + 128}   (~1/3 of baseline)")
 
 
 if __name__ == "__main__":
