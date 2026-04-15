@@ -19,8 +19,11 @@ from config import (
     N_PROPRIO, N_SCAN, N_PRIV_EXPLICIT, N_PRIV_LATENT, HISTORY_LEN, N_OBS,
     DEPTH_LATENT_DIM,
     DEFAULT_STAND_ANGLES_SDK, ACTION_SCALE, CLIP_ACTIONS,
-    ObsScales
+    ObsScales,
 )
+
+# Shared embedding layout: [0:32] depth latent, [32:34] yaw prediction
+SHARED_EMBEDDING_LEN = DEPTH_LATENT_DIM + 2
 
 
 class PolicyRunner:
@@ -50,6 +53,15 @@ class PolicyRunner:
         self.shared_embedding = shared_embedding
         self.shared_proprio = shared_proprio
 
+        # Zero-copy numpy views over the shared ctypes arrays. One memcpy per
+        # transfer instead of 32+53 python attribute accesses per policy tick.
+        self._emb_view = np.frombuffer(
+            shared_embedding.get_obj(), dtype=np.float32
+        )  # shape (34,)
+        self._prop_view = np.frombuffer(
+            shared_proprio.get_obj(), dtype=np.float32
+        )  # shape (N_PROPRIO,)
+
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         print(f"PolicyRunner using device: {self.device}")
 
@@ -60,15 +72,11 @@ class PolicyRunner:
 
         self.base_policy = None
 
-        # History buffer for observations
-        self.obs_history = None
+        # History buffer for observations (circular, avoids per-tick np.roll alloc)
+        self.obs_history = np.zeros((HISTORY_LEN, N_PROPRIO), dtype=np.float32)
+        self._hist_idx = 0
+        self._hist_initialized = False
         self.last_actions = np.zeros(12, dtype=np.float32)
-
-        # Cache for depth latent
-        self._cached_depth_latent = np.zeros(DEPTH_LATENT_DIM, dtype=np.float32)
-
-        # Cache for yaw prediction from depth encoder (sin, cos)
-        self._cached_yaw_pred = np.zeros(2, dtype=np.float32)
 
     def load_models(self) -> bool:
         """
@@ -87,6 +95,16 @@ class PolicyRunner:
             # Initialize history buffer
             self.reset()
 
+            # Preallocate inference tensors (reused every tick; no per-tick allocator churn).
+            pin = self.device.type == "cuda"
+            self._obs_cpu = torch.zeros(1, N_OBS, dtype=torch.float32, pin_memory=pin)
+            self._depth_cpu = torch.zeros(1, DEPTH_LATENT_DIM, dtype=torch.float32, pin_memory=pin)
+            self._obs_gpu = torch.zeros(1, N_OBS, dtype=torch.float32, device=self.device)
+            self._depth_gpu = torch.zeros(1, DEPTH_LATENT_DIM, dtype=torch.float32, device=self.device)
+            # numpy views so we can write into the pinned buffer without extra copy
+            self._obs_cpu_np = self._obs_cpu.numpy()[0]
+            self._depth_cpu_np = self._depth_cpu.numpy()[0]
+
             # GPU warmup for base policy
             print("Running GPU warmup for base policy...")
             print(f"  Device: {self.device}")
@@ -94,14 +112,11 @@ class PolicyRunner:
             if torch.cuda.is_available():
                 print(f"  CUDA device: {torch.cuda.get_device_name(0)}")
 
-            dummy_obs = torch.zeros(1, N_OBS, dtype=torch.float32, device=self.device)
-            dummy_latent = torch.zeros(1, DEPTH_LATENT_DIM, dtype=torch.float32, device=self.device)
-
             import time
             for i in range(5):
                 t0 = time.time()
-                with torch.no_grad():
-                    _ = self.base_policy(dummy_obs, dummy_latent)
+                with torch.inference_mode():
+                    _ = self.base_policy(self._obs_gpu, self._depth_gpu)
                 if self.device.type == "cuda":
                     torch.cuda.synchronize()
                 t1 = time.time()
@@ -120,25 +135,22 @@ class PolicyRunner:
 
     def reset(self):
         """Reset the policy state (history buffers, last actions)."""
-        self.obs_history = None
-        self.last_actions = np.zeros(12, dtype=np.float32)
+        self.obs_history.fill(0.0)
+        self._hist_idx = 0
+        self._hist_initialized = False
+        self.last_actions[:] = 0.0
 
     def get_depth_latent_from_shared(self) -> np.ndarray:
         """Read depth latent from shared memory (written by depth encoder process)."""
-        for i in range(DEPTH_LATENT_DIM):
-            self._cached_depth_latent[i] = self.shared_embedding[i]
-        return self._cached_depth_latent.copy()
+        return self._emb_view[:DEPTH_LATENT_DIM].copy()
 
     def get_yaw_pred_from_shared(self) -> np.ndarray:
         """Read yaw prediction from shared memory (written by depth encoder after depth latent)."""
-        self._cached_yaw_pred[0] = self.shared_embedding[DEPTH_LATENT_DIM]
-        self._cached_yaw_pred[1] = self.shared_embedding[DEPTH_LATENT_DIM + 1]
-        return self._cached_yaw_pred.copy()
+        return self._emb_view[DEPTH_LATENT_DIM:DEPTH_LATENT_DIM + 2].copy()
 
     def write_proprio_to_shared(self, proprio: np.ndarray):
         """Write proprio to shared memory for depth encoder process."""
-        for i in range(min(len(proprio), N_PROPRIO)):
-            self.shared_proprio[i] = proprio[i]
+        self._prop_view[:] = proprio
 
     def build_proprio_obs(
         self,
@@ -202,60 +214,70 @@ class PolicyRunner:
         Returns:
             Full observation [N_OBS]
         """
-        # Initialize history if needed
-        if self.obs_history is None:
-            proprio_masked = proprio.copy()
-            proprio_masked[6:8] = 0.0
-            self.obs_history = np.tile(proprio_masked, (HISTORY_LEN, 1))
+        # Masked proprio for history (training zeros delta_yaw/delta_next_yaw in history)
+        proprio_masked = proprio.copy()
+        proprio_masked[6:8] = 0.0
 
-        # Build full observation using history from previous steps
-        scan = np.zeros(N_SCAN, dtype=np.float32)
-        priv_explicit = np.zeros(N_PRIV_EXPLICIT, dtype=np.float32)
-        priv_latent = np.zeros(N_PRIV_LATENT, dtype=np.float32)
+        # On first tick, warm-fill the circular buffer with the current masked proprio
+        # so the history section is self-consistent rather than zeros.
+        if not self._hist_initialized:
+            self.obs_history[:] = proprio_masked
+            self._hist_initialized = True
 
-        obs = np.concatenate([
-            proprio,                           # [53] current proprio
-            scan,                              # [132]
-            priv_explicit,                     # [9]
-            priv_latent,                       # [29]
-            self.obs_history.flatten(),        # [530] history from PREVIOUS steps
-        ]).astype(np.float32)
+        # Write directly into the preallocated obs buffer. Layout matches
+        # training: [proprio, scan, priv_explicit, priv_latent, history_flat].
+        # scan / priv_explicit / priv_latent stay zero — the JIT overwrites
+        # priv_explicit via its internal estimator, scan is replaced by
+        # depth_latent in the actor, and priv_latent is unused at inference.
+        obs_flat = self._obs_cpu_np
+        obs_flat[:N_PROPRIO] = proprio
+        # [N_PROPRIO : N_PROPRIO + N_SCAN + N_PRIV_EXPLICIT + N_PRIV_LATENT] stays 0
+        hist_start = N_PROPRIO + N_SCAN + N_PRIV_EXPLICIT + N_PRIV_LATENT
+        # Unroll the circular buffer into the history slot in correct (oldest→newest) order
+        head = self._hist_idx
+        first_rows = HISTORY_LEN - head
+        hist_slice = obs_flat[hist_start:].reshape(HISTORY_LEN, N_PROPRIO)
+        hist_slice[:first_rows] = self.obs_history[head:]
+        if head > 0:
+            hist_slice[first_rows:] = self.obs_history[:head]
 
-        # Update history buffer (FIFO) for next step
-        proprio_for_history = proprio.copy()
-        proprio_for_history[6:8] = 0.0
+        # Append current masked proprio as the newest entry (overwrites oldest slot).
+        self.obs_history[self._hist_idx] = proprio_masked
+        self._hist_idx = (self._hist_idx + 1) % HISTORY_LEN
 
-        self.obs_history = np.roll(self.obs_history, -1, axis=0)
-        self.obs_history[-1] = proprio_for_history
+        return obs_flat
 
-        return obs
-
-    @torch.no_grad()
+    @torch.inference_mode()
     def get_action(
         self,
-        obs: np.ndarray,
-        depth_latent: np.ndarray
+        depth_latent: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get action from the base policy.
 
+        Reads the observation from the preallocated CPU buffer populated by
+        build_full_obs(). Copies it to GPU, runs inference, returns results.
+
         Args:
-            obs: Full observation [N_OBS]
             depth_latent: Depth encoder output [32]
 
         Returns:
             Tuple of (joint position targets in SDK order [12], raw actions for logging [12])
         """
-        # Convert to tensors
-        obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(self.device)
-        depth_tensor = torch.from_numpy(depth_latent).float().unsqueeze(0).to(self.device)
+        # Copy depth latent into pinned buffer and then to GPU
+        self._depth_cpu_np[:] = depth_latent
+        if self.device.type == "cuda":
+            self._obs_gpu.copy_(self._obs_cpu, non_blocking=True)
+            self._depth_gpu.copy_(self._depth_cpu, non_blocking=True)
+        else:
+            self._obs_gpu.copy_(self._obs_cpu)
+            self._depth_gpu.copy_(self._depth_cpu)
 
-        # Run policy
-        actions_raw = self.base_policy(obs_tensor, depth_tensor)
-        actions_raw = actions_raw[0].cpu().numpy()
+        actions_raw_t = self.base_policy(self._obs_gpu, self._depth_gpu)
+        actions_raw = actions_raw_t[0].detach().cpu().numpy().astype(np.float32).copy()
 
-        # Store RAW actions for next step
-        self.last_actions = actions_raw.copy()
+        # Store RAW actions for next step's proprio[37:49]
+        self.last_actions[:] = actions_raw
 
         # Clip raw actions then scale to joint targets (matches training pipeline)
         actions_clipped = np.clip(actions_raw, -CLIP_ACTIONS, CLIP_ACTIONS)
@@ -308,13 +330,13 @@ class PolicyRunner:
         # Write proprio to shared memory for depth encoder process
         self.write_proprio_to_shared(proprio)
 
-        # Build full observation
-        obs = self.build_full_obs(proprio)
+        # Populate the preallocated obs buffer with current proprio + history
+        self.build_full_obs(proprio)
 
         # Read depth latent from shared memory (from depth encoder process)
         depth_latent = self.get_depth_latent_from_shared()
 
         # Get action
-        targets, raw_actions = self.get_action(obs, depth_latent)
+        targets, raw_actions = self.get_action(depth_latent)
 
         return targets, raw_actions

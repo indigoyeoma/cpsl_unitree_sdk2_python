@@ -12,16 +12,19 @@ Architecture matches training (RecurrentDepthBackbone + DepthOnlyFCBackbone58x87
   - GRU: input=32, hidden=512
   - output_mlp: Linear(512, 34) -> 32 depth latent + 2 yaw
 """
+import os
 import time
 import numpy as np
 import torch
 import torch.nn as nn
 from multiprocessing import Array, Value
-from ctypes import c_float, c_bool
+from ctypes import c_float, c_bool, c_int64
 
 from config import (
     DEPTH_OUTPUT_HEIGHT, DEPTH_OUTPUT_WIDTH, N_PROPRIO,
-    VISION_WEIGHT_PATH, DEPTH_LATENT_DIM
+    VISION_WEIGHT_PATH, DEPTH_LATENT_DIM,
+    ENABLE_DEPTH_FILTERS, USE_DEPTH_ENCODER_YAW,
+    GOAL_X, GOAL_Y, DRIFT_CORRECTION,
 )
 
 
@@ -111,6 +114,8 @@ def depth_encoder_loop(
     use_camera: bool = True,
     show_gui: bool = False,
     save_images: Value = None,
+    heartbeat: Value = None,
+    reset_hidden: Value = None,
 ):
     """
     Main loop for depth encoder process.
@@ -126,7 +131,18 @@ def depth_encoder_loop(
         use_camera: Whether to use real RealSense camera or dummy zero frames
         show_gui: Whether to show a live depth visualization window (requires cv2)
         save_images: Optional flag; set True from main process to trigger saving 10 frames
+        heartbeat: Optional counter incremented each loop iteration (watchdog signal)
+        reset_hidden: Optional flag; set True from main process to reset GRU hidden state
+                      (e.g., on WALKING entry so recurrence doesn't leak across episodes)
     """
+    # Lower scheduling priority so this process yields to the policy process
+    # when both compete for CPU/GPU. Best-effort; ignore on platforms that don't
+    # allow it (rare).
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
+
     print("[DepthEncoder] Starting depth encoder process...")
 
     # Import OpenCV if GUI is requested
@@ -159,10 +175,12 @@ def depth_encoder_loop(
     camera = None
     if use_camera:
         from depth_camera import DepthCamera
-        camera = DepthCamera(enable_filters=True)
+        camera = DepthCamera(enable_filters=ENABLE_DEPTH_FILTERS)
         if not camera.start():
             print("[DepthEncoder] WARNING: Failed to start camera, using dummy frames")
             use_camera = False
+        else:
+            print(f"[DepthEncoder] Camera filters: {'ON' if ENABLE_DEPTH_FILTERS else 'OFF'}")
 
     # Warmup
     print("[DepthEncoder] Running warmup...")
@@ -181,14 +199,29 @@ def depth_encoder_loop(
 
     # Image saving state
     images_to_save = 0
-    import os
     save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "depth_captures")
+
+    # Zero-copy numpy views over shared memory — single memcpy per transfer.
+    emb_view = np.frombuffer(shared_embedding.get_obj(), dtype=np.float32)  # shape (34,)
+    prop_view = np.frombuffer(shared_proprio.get_obj(), dtype=np.float32)   # shape (N_PROPRIO,)
+
+    # Log mode of yaw source once at startup so it's easy to audit in captured logs.
+    if USE_DEPTH_ENCODER_YAW:
+        print("[DepthEncoder] Yaw source: depth encoder prediction (training mode)")
+    else:
+        print(f"[DepthEncoder] Yaw source: FIXED (atan2({GOAL_Y},{GOAL_X})+{DRIFT_CORRECTION}) — DEBUG MODE")
 
     loop_count = 0
     last_frame_ts = 0.0
 
     while not should_stop.value:
         t_start = time.time()
+
+        # Main process may request a recurrent-state reset (e.g., WALKING entry).
+        if reset_hidden is not None and reset_hidden.value:
+            depth_encoder.reset_hidden()
+            reset_hidden.value = False
+            print("[DepthEncoder] GRU hidden state reset")
 
         # Check if we should start saving images
         if save_images is not None and save_images.value and images_to_save == 0:
@@ -200,6 +233,10 @@ def depth_encoder_loop(
             os.makedirs(save_subdir, exist_ok=True)
             print(f"[DepthEncoder] Saving 10 depth images to {save_subdir}")
             save_count = 0
+            # Raw frames are normally not retained (saves a 600 kB copy per
+            # tick) — turn them on for the duration of this save burst only.
+            if camera is not None:
+                camera.set_capture_raw(True)
 
         # Get depth frame
         if use_camera and camera is not None:
@@ -254,10 +291,15 @@ def depth_encoder_loop(
             images_to_save -= 1
             if images_to_save == 0:
                 print(f"[DepthEncoder] Done! Images saved to: {save_subdir}")
+                # Stop paying for raw-frame copies on the capture thread.
+                if camera is not None:
+                    camera.set_capture_raw(False)
             time.sleep(0.1)
 
-        # Get proprio from shared memory (written by policy process)
-        proprio_np = np.array(shared_proprio[:], dtype=np.float32)
+        # Get proprio from shared memory (one memcpy via numpy view).
+        # We copy into a local ndarray to guarantee ownership while the policy
+        # process may be concurrently writing the next proprio.
+        proprio_np = prop_view.copy()
 
         # Convert to tensors
         depth_tensor = torch.from_numpy(depth_frame).float().unsqueeze(0).to(device)
@@ -265,44 +307,29 @@ def depth_encoder_loop(
 
         # Run encoder (with GRU hidden state maintained across frames)
         t_inf_start = time.time()
-        with torch.no_grad():
+        with torch.inference_mode():
             output = depth_encoder(depth_tensor, proprio_tensor)
-            embedding = output[0, :DEPTH_LATENT_DIM].numpy()  # First 32 dims
+            output_np = output[0].cpu().numpy()  # full 34-d output
         depth_encoder.detach_hidden()
         t_inf_end = time.time()
 
-        # Write depth latent to shared memory (indices 0..31)
-        for i in range(DEPTH_LATENT_DIM):
-            shared_embedding[i] = float(embedding[i])
-
-        # =====================================================================
-        # Yaw Prediction (indices 32 and 33)
-        # =====================================================================
-        # Option A: Use depth encoder prediction (for terrain with visual features)
-        # Option B: Use fixed goal direction (for flat ground testing)
-        # =====================================================================
-
-        USE_DEPTH_ENCODER_YAW = False  # Set True to use model's yaw prediction
-
-        # Fixed goal direction (used when USE_DEPTH_ENCODER_YAW = False)
-        GOAL_X = 10.0   # meters ahead (always positive)
-        GOAL_Y = 0.0    # meters to side (positive=left, negative=right)
-        DRIFT_CORRECTION = 0.25  # positive=turn left; tune if robot drifts
-
-        import math
-
+        # Compose the 34-float embedding locally, then publish with a single
+        # buffer-level assignment (atomic-ish for the reader).
         if USE_DEPTH_ENCODER_YAW:
-            # Model output is Tanh [-1,1], scale to [-1.5, 1.5] radians
-            yaw_pred = output[0, DEPTH_LATENT_DIM:DEPTH_LATENT_DIM + 2].numpy() * 1.5
-            YAW_BIAS_CORRECTION = 0.0
-            shared_embedding[DEPTH_LATENT_DIM] = float(yaw_pred[0] - YAW_BIAS_CORRECTION)
-            shared_embedding[DEPTH_LATENT_DIM + 1] = float(yaw_pred[1])
+            # Tanh output in [-1,1] scaled to [-1.5, 1.5] radians (matches training)
+            emb_view[:DEPTH_LATENT_DIM] = output_np[:DEPTH_LATENT_DIM]
+            emb_view[DEPTH_LATENT_DIM] = float(output_np[DEPTH_LATENT_DIM] * 1.5)
+            emb_view[DEPTH_LATENT_DIM + 1] = float(output_np[DEPTH_LATENT_DIM + 1] * 1.5)
         else:
+            import math
             delta_yaw = math.atan2(GOAL_Y, GOAL_X) + DRIFT_CORRECTION
-            shared_embedding[DEPTH_LATENT_DIM] = float(delta_yaw)
-            shared_embedding[DEPTH_LATENT_DIM + 1] = 0.0
+            emb_view[:DEPTH_LATENT_DIM] = output_np[:DEPTH_LATENT_DIM]
+            emb_view[DEPTH_LATENT_DIM] = float(delta_yaw)
+            emb_view[DEPTH_LATENT_DIM + 1] = 0.0
 
         embedding_ready.value = True
+        if heartbeat is not None:
+            heartbeat.value += 1
 
         t_end = time.time()
         loop_count += 1

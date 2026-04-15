@@ -14,8 +14,8 @@ POLICY_DECIMATION = 10     # Run policy every 10 motor ticks (500Hz / 10 = 50Hz)
 # =============================================================================
 # PD Gains (matching training)
 # =============================================================================
-KP_WALK = 35.0             # Walking stiffness [N*m/rad]
-KD_WALK = 1.0              # Walking damping [N*m*s/rad] - increased from 0.6 to reduce vibration
+KP_WALK = 40.0             # Walking stiffness [N*m/rad] - matches training go2_student_config.py stiffness={joint:40}
+KD_WALK = 1.0              # Walking damping [N*m*s/rad] - matches training damping={joint:1.0}
 KP_STAND = 60.0            # Standing stiffness (matches Unitree example)
 KD_STAND = 5.0             # Standing damping (matches Unitree example)
 
@@ -149,6 +149,40 @@ FIXED_VEL_Y = 0.0          # Lateral velocity [m/s]
 FIXED_VEL_YAW = 0.0        # Yaw rate [rad/s]
 
 # =============================================================================
+# Depth camera filters
+# Training never applied RealSense spatial/temporal filters; the encoder was
+# trained against raw+noise depth. Filters also add frame latency. Default OFF.
+# =============================================================================
+ENABLE_DEPTH_FILTERS = False
+
+# =============================================================================
+# Yaw source for proprioceptive observation [6:8]
+# True  : use depth encoder's learned prediction (matches training pipeline)
+# False : inject a constant direction (debug/straight-walk only)
+# =============================================================================
+USE_DEPTH_ENCODER_YAW = True
+GOAL_X = 10.0              # (fallback mode) meters ahead
+GOAL_Y = 0.0               # (fallback mode) meters to side
+DRIFT_CORRECTION = 0.25    # (fallback mode) empirical yaw bias
+
+# =============================================================================
+# Foot contact detection — 20/15 N hysteresis
+# Training uses sim contact-force magnitude > 2 N; deploy uses Go2 piezo scalar.
+# Different sensors, so values are empirical; hysteresis mirrors training's
+# contact_filt = contact OR last_contact and removes chatter during lift-off.
+# =============================================================================
+FOOT_CONTACT_ON_N = 20.0
+FOOT_CONTACT_OFF_N = 15.0
+
+# =============================================================================
+# Depth encoder heartbeat / watchdog
+# If the depth encoder process doesn't advance its heartbeat within this many
+# policy ticks, the main thread trips to EMERGENCY. Policy runs at 50 Hz, depth
+# at ~10 Hz, so we allow 20 ticks (≈400 ms) of stale data before reacting.
+# =============================================================================
+DEPTH_STALE_TICKS = 20
+
+# =============================================================================
 # Standing Sequence Timing (matches Unitree example: 500 ticks @ 500Hz = 1.0s)
 # =============================================================================
 STAND_UP_DURATION = 1.0    # seconds to interpolate to stand
@@ -160,5 +194,5 @@ SIT_DOWN_DURATION = 1.0    # seconds to interpolate to sit
 import os
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(_THIS_DIR, "policy")
-BASE_JIT_PATH = os.path.join(MODEL_DIR, "test_student-20500-base_jit.pt")
-VISION_WEIGHT_PATH = os.path.join(MODEL_DIR, "test_student-20500-vision_weight.pt")
+BASE_JIT_PATH = os.path.join(MODEL_DIR, "test_student_v2-10000-base_jit.pt")
+VISION_WEIGHT_PATH = os.path.join(MODEL_DIR, "test_student_v2-10000-vision_weight.pt")

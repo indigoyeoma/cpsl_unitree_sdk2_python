@@ -24,13 +24,14 @@ Dryrun mode saves sensor logs to: deploy_log_YYYYMMDD_HHMMSS.txt
 import sys
 import os
 import time
+import threading
 import argparse
 import numpy as np
 from enum import IntEnum
 from typing import Optional
 from datetime import datetime
 from multiprocessing import Process, Array, Value
-from ctypes import c_float, c_bool
+from ctypes import c_float, c_bool, c_int64
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,14 +45,16 @@ from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwi
 from unitree_sdk2py.go2.sport.sport_client import SportClient
 
 from config import (
-    MOTOR_DT, POLICY_DECIMATION,
+    MOTOR_DT, POLICY_DECIMATION, CONTROL_DT,
     KP_WALK, KD_WALK, KP_STAND, KD_STAND,
     ACTION_SCALE, N_PROPRIO, DEPTH_LATENT_DIM,
     DEFAULT_STAND_ANGLES_SDK, JOINT_POS_MIN, JOINT_POS_MAX,
     FIXED_VEL_X, SDK_TO_TRAIN_JOINTS,
     DEPTH_NEAR, DEPTH_FAR,
     TORQUE_LIMITS, CLIP_ACTIONS,
-    DEPTH_OUTPUT_WIDTH, DEPTH_OUTPUT_HEIGHT
+    DEPTH_OUTPUT_WIDTH, DEPTH_OUTPUT_HEIGHT,
+    FOOT_CONTACT_ON_N, FOOT_CONTACT_OFF_N,
+    DEPTH_STALE_TICKS,
 )
 from policy_runner import PolicyRunner
 from depth_encoder_process import depth_encoder_loop
@@ -139,6 +142,11 @@ class Go2Deployment:
         self.proprio_ready = Value(c_bool, False)
         self.depth_encoder_stop = Value(c_bool, False)
         self.save_depth_images = Value(c_bool, False)  # Flag to save depth images
+        # Heartbeat increments each depth encoder loop; main uses it to detect
+        # a dead or stalled encoder and trip to EMERGENCY before it can hurt us.
+        self.depth_heartbeat = Value(c_int64, 0)
+        # Signal the encoder to reset its GRU hidden state on the next iteration.
+        self.reset_depth_hidden = Value(c_bool, False)
 
         # Depth encoder process
         self.depth_encoder_process: Optional[Process] = None
@@ -153,6 +161,24 @@ class Go2Deployment:
         # Thread control
         self.running = False
         self.control_thread = None
+        self.policy_thread: Optional[threading.Thread] = None
+
+        # Policy thread produces motor targets asynchronously from the 500 Hz
+        # motor loop. policy_lock guards (policy_target, policy_raw_actions,
+        # policy_target_valid). Foot-contact hysteresis state also lives here
+        # since the policy thread owns it.
+        self.policy_lock = threading.Lock()
+        self.policy_target = DEFAULT_STAND_ANGLES_SDK.copy()
+        self.policy_raw_actions = np.zeros(12, dtype=np.float32)
+        self.policy_target_valid = False
+        self._foot_contact_state = np.zeros(4, dtype=np.float32)  # latched
+        # Control thread requests a policy reset by setting this flag; the
+        # policy thread consumes it at the top of its loop to avoid touching
+        # the policy's internal state concurrently with inference.
+        self._pending_policy_reset = False
+        # Watchdog bookkeeping (updated by motor loop):
+        self._last_heartbeat_value = 0
+        self._last_heartbeat_tick = 0
 
         # Logging (written at policy rate ~50Hz, to file only)
         self.log_file = None
@@ -265,6 +291,8 @@ class Go2Deployment:
                 not self.no_camera,      # use_camera
                 self.show_depth,         # show_gui
                 self.save_depth_images,  # save_images flag
+                self.depth_heartbeat,    # heartbeat counter
+                self.reset_depth_hidden, # GRU reset signal
             ),
             daemon=True
         )
@@ -553,8 +581,21 @@ class Go2Deployment:
             print("STATE: Sitting down...")
 
         elif new_state == State.WALKING:
-            self.policy.reset()
             self.policy_tick = 0
+            # Clear any stale target from a previous walk so the motor loop
+            # holds the stand pose until the policy thread produces a fresh
+            # one. Ask the policy thread to reset its internal state (history
+            # buffer + last_actions) — we don't call self.policy.reset()
+            # directly here because the policy thread may be mid-inference.
+            with self.policy_lock:
+                self.policy_target = DEFAULT_STAND_ANGLES_SDK.copy()
+                self.policy_raw_actions = np.zeros(12, dtype=np.float32)
+                self.policy_target_valid = False
+                self._foot_contact_state = np.zeros(4, dtype=np.float32)
+                self._pending_policy_reset = True
+            # Ask the depth encoder to reset its GRU hidden state so recurrent
+            # activations from a prior walk don't leak into this one.
+            self.reset_depth_hidden.value = True
             print("STATE: Walking - policy active")
 
         elif new_state == State.IDLE:
@@ -619,14 +660,15 @@ class Go2Deployment:
             targets: Joint position targets in SDK order [12]
             kp: Position gain
             kd: Damping gain
-            skip_torque_limit: Skip torque limiting (for smooth interpolation states)
+            skip_torque_limit: Deprecated; torque-limit clipping is always
+                applied (even during interpolation) because it is cheap and
+                protects the robot if it is bumped mid-stand/sit.
         """
         # Clip to joint limits
         targets = np.clip(targets, JOINT_POS_MIN, JOINT_POS_MAX)
 
-        # Clip by torque limits (only during walking, not during stand/sit interpolation)
-        if not skip_torque_limit:
-            targets = self._clip_by_torque_limit(targets, kp, kd)
+        # Always clip by torque limits — free safety net.
+        targets = self._clip_by_torque_limit(targets, kp, kd)
 
         for i in range(12):
             self.low_cmd.motor_cmd[i].mode = 0x01
@@ -751,24 +793,42 @@ class Go2Deployment:
                 self._enter_state(State.SITTING_DOWN)
 
         elif self.state == State.WALKING:
-            # Run policy at 50Hz
-            if self.tick % POLICY_DECIMATION == 0:
-                self.policy_tick += 1
-                # Depth embedding is read from shared memory (from depth encoder process)
-                self.current_target = self._run_policy()
+            # Policy inference runs asynchronously on self.policy_thread.
+            # Here we just grab the latest target under the lock and send it.
+            # If the policy thread hasn't produced a target yet (first few ticks
+            # after entering WALKING), fall back to the stand pose so nothing
+            # surprising happens during that transient.
+            with self.policy_lock:
+                if self.policy_target_valid:
+                    target = self.policy_target
+                else:
+                    target = DEFAULT_STAND_ANGLES_SDK
 
-            # Keep torque limiting during walking for safety
-            self._send_motor_commands(self.current_target, KP_WALK, KD_WALK)
+            # Depth-encoder watchdog: if the heartbeat hasn't advanced in
+            # DEPTH_STALE_TICKS policy ticks (~400 ms), the encoder is dead
+            # and we're running on stale latents. Trip emergency.
+            if self._depth_encoder_is_stale():
+                print("!!! Depth encoder heartbeat stalled — tripping EMERGENCY !!!")
+                self._enter_state(State.EMERGENCY)
+                self._send_emergency_stop()
+                return
+
+            self._send_motor_commands(target, KP_WALK, KD_WALK)
 
             # Start button to reset policy (keep walking)
             if new_presses & self.WirelessButtons.start:
-                self.policy.reset()
                 self.policy_tick = 0
+                with self.policy_lock:
+                    self.policy_target_valid = False
+                    self._foot_contact_state[:] = 0.0
+                    self._pending_policy_reset = True
+                self.reset_depth_hidden.value = True
                 print("  [Start] Policy reset - continuing to walk")
 
             # B to reset policy and sit down
             if buttons & self.WirelessButtons.B:
-                self.policy.reset()
+                with self.policy_lock:
+                    self._pending_policy_reset = True
                 print("  Policy reset - sitting down")
                 self._enter_state(State.SITTING_DOWN)
 
@@ -795,39 +855,108 @@ class Go2Deployment:
             self._send_emergency_stop()
             # Can only exit emergency with restart
 
-    def _run_policy(self) -> Optional[np.ndarray]:
+    def _depth_encoder_is_stale(self) -> bool:
+        """Return True if the depth encoder's heartbeat hasn't advanced recently.
+
+        Compares the current heartbeat against the last value we saw and how
+        many motor ticks ago we saw it. Stale beyond DEPTH_STALE_TICKS policy
+        ticks (= DEPTH_STALE_TICKS * POLICY_DECIMATION motor ticks ≈ 400 ms).
         """
-        Run one step of the vision policy.
+        current = self.depth_heartbeat.value
+        if current != self._last_heartbeat_value:
+            self._last_heartbeat_value = current
+            self._last_heartbeat_tick = self.tick
+            return False
+        stale_motor_ticks = self.tick - self._last_heartbeat_tick
+        return stale_motor_ticks > DEPTH_STALE_TICKS * POLICY_DECIMATION
 
-        Depth embedding is read from shared memory (from depth encoder process).
+    def _update_foot_contacts(self, foot_force: np.ndarray) -> np.ndarray:
+        """Hysteresis-based foot contact detection.
 
-        Returns:
-            Joint position targets in SDK order [12]
+        A single threshold chatters during lift-off; mirror training's
+        contact_filt = contact OR last_contact with a 20/15 N band.
+        Returns a fresh (4,) float32 array so the caller can log it safely.
         """
-        t_start = time.time()
+        for i in range(4):
+            if self._foot_contact_state[i] > 0.5:
+                if foot_force[i] < FOOT_CONTACT_OFF_N:
+                    self._foot_contact_state[i] = 0.0
+            else:
+                if foot_force[i] > FOOT_CONTACT_ON_N:
+                    self._foot_contact_state[i] = 1.0
+        return self._foot_contact_state.copy()
 
-        # Get robot state
+    def _policy_loop(self):
+        """Policy thread: runs at ~50 Hz independently of the motor thread.
+
+        Reads sensors, runs inference, and publishes a joint target under
+        self.policy_lock. Only active while state == State.WALKING.
+        """
+        period = CONTROL_DT  # 0.02 s
+        while self.running:
+            loop_start = time.perf_counter()
+
+            # Consume any reset request from the control thread before touching
+            # the policy. Doing this here (rather than in the control thread)
+            # avoids racing the policy's internal buffers with inference.
+            reset_requested = False
+            with self.policy_lock:
+                if self._pending_policy_reset:
+                    reset_requested = True
+                    self._pending_policy_reset = False
+            if reset_requested and self.policy is not None:
+                self.policy.reset()
+
+            if self.state == State.WALKING and self.low_state is not None:
+                self.policy_tick += 1
+                self._run_policy_once()
+
+            elapsed = time.perf_counter() - loop_start
+            sleep_for = period - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+    def _run_policy_once(self):
+        """Run one inference step and publish the target under the lock."""
+        t_start = time.perf_counter()
+
+        # Batch the low_state read once (instead of multiple list comprehensions).
         state = self.low_state
-        ang_vel = np.array([
-            state.imu_state.gyroscope[0],
-            state.imu_state.gyroscope[1],
-            state.imu_state.gyroscope[2],
-        ], dtype=np.float32)
+        imu = state.imu_state
+        ang_vel = np.array(
+            [imu.gyroscope[0], imu.gyroscope[1], imu.gyroscope[2]],
+            dtype=np.float32,
+        )
+        roll = float(imu.rpy[0])
+        pitch = float(imu.rpy[1])
 
-        roll = state.imu_state.rpy[0]
-        pitch = state.imu_state.rpy[1]
+        dof_pos = np.empty(12, dtype=np.float32)
+        dof_vel = np.empty(12, dtype=np.float32)
+        motor_state = state.motor_state
+        for i in range(12):
+            dof_pos[i] = motor_state[i].q
+            dof_vel[i] = motor_state[i].dq
 
-        dof_pos = np.array([state.motor_state[i].q for i in range(12)], dtype=np.float32)
-        dof_vel = np.array([state.motor_state[i].dq for i in range(12)], dtype=np.float32)
+        foot_force = np.empty(4, dtype=np.float32)
+        ff = state.foot_force
+        for i in range(4):
+            foot_force[i] = ff[i]
 
-        # Foot contacts (threshold force)
-        foot_contacts = np.array([
-            1.0 if state.foot_force[i] > 20 else 0.0 for i in range(4)
-        ], dtype=np.float32)
+        # NaN guard: if any critical sensor reading is non-finite, skip this
+        # policy tick and keep last target. One NaN propagated to motors can
+        # trigger a torque spike.
+        if not (
+            np.all(np.isfinite(ang_vel))
+            and np.isfinite(roll) and np.isfinite(pitch)
+            and np.all(np.isfinite(dof_pos))
+            and np.all(np.isfinite(dof_vel))
+        ):
+            print(f"  [WARNING] tick={self.policy_tick}: non-finite sensor reading, holding last target")
+            return
 
-        t_before_inference = time.time()
+        foot_contacts = self._update_foot_contacts(foot_force)
 
-        # Run inference (depth embedding read from shared memory inside run_inference)
+        t_before_inference = time.perf_counter()
         targets, raw_actions = self.policy.run_inference(
             ang_vel=ang_vel,
             roll=roll,
@@ -837,52 +966,61 @@ class Go2Deployment:
             foot_contacts=foot_contacts,
             cmd_vel_x=FIXED_VEL_X,
         )
+        t_after_inference = time.perf_counter()
 
-        t_after_inference = time.time()
+        # Publish target for the motor loop to consume.
+        with self.policy_lock:
+            self.policy_target = targets
+            self.policy_raw_actions = raw_actions
+            self.policy_target_valid = True
 
-        # Print timing diagnostics periodically
-        if self.policy_tick % 50 == 0:  # Every 50 ticks (~1 second at 50Hz)
+        # Periodic diagnostics.
+        if self.policy_tick % 50 == 0:
             total_ms = (t_after_inference - t_start) * 1000
             inference_ms = (t_after_inference - t_before_inference) * 1000
             print(f"  [MLP] tick={self.policy_tick}: total={total_ms:.1f}ms, inference={inference_ms:.1f}ms")
 
         # Warn if raw actions are hitting the clip limit (policy is saturating)
-        action_max = np.abs(raw_actions).max()
+        action_max = float(np.abs(raw_actions).max())
         if action_max > CLIP_ACTIONS * 0.9:
             print(f"  [WARNING] tick={self.policy_tick}: Actions near clip limit! "
                   f"max={action_max:.3f} (clip={CLIP_ACTIONS})")
 
-        # Get yaw prediction from shared memory for logging
-        delta_yaw = float(self.shared_embedding[DEPTH_LATENT_DIM])
-        delta_next_yaw = float(self.shared_embedding[DEPTH_LATENT_DIM + 1])
-
-        # Compute depth embedding norm for logging (rough signal quality indicator)
-        depth_latent = [self.shared_embedding[i] for i in range(DEPTH_LATENT_DIM)]
-        depth_embedding_norm = float(np.linalg.norm(depth_latent))
-
-        # Log comprehensive data for debugging (depth is in separate process now)
-        extra_debug = {
-            'ang_vel': ang_vel.tolist(),
-            'roll': float(roll),
-            'pitch': float(pitch),
-            'dof_pos_sdk': dof_pos.tolist(),
-            'dof_vel_sdk': dof_vel.tolist(),
-            'foot_contacts': foot_contacts.tolist(),
-            'last_actions': self.policy.last_actions.tolist() if self.policy else None,
-            'raw_actions': raw_actions.tolist(),
-            'delta_yaw': delta_yaw,
-            'delta_next_yaw': delta_next_yaw,
-        }
-        if self.policy_tick % 50 == 0:
-            print(f"  [Depth] embedding_norm={depth_embedding_norm:.3f}, "
-                  f"delta_yaw={delta_yaw:+.3f} rad")
-        depth_stats = {'norm': depth_embedding_norm}
-        self._log_sensor_data(depth_stats=depth_stats, policy_output=targets, extra_debug=extra_debug)
-
-        return targets
+        # Logging throttled to ~10 Hz to reduce file I/O on this thread.
+        if self.policy_tick % 5 == 0:
+            delta_yaw = float(self.shared_embedding[DEPTH_LATENT_DIM])
+            delta_next_yaw = float(self.shared_embedding[DEPTH_LATENT_DIM + 1])
+            depth_latent = np.frombuffer(
+                self.shared_embedding.get_obj(), dtype=np.float32
+            )[:DEPTH_LATENT_DIM]
+            depth_embedding_norm = float(np.linalg.norm(depth_latent))
+            extra_debug = {
+                'ang_vel': ang_vel.tolist(),
+                'roll': roll,
+                'pitch': pitch,
+                'dof_pos_sdk': dof_pos.tolist(),
+                'dof_vel_sdk': dof_vel.tolist(),
+                'foot_contacts': foot_contacts.tolist(),
+                'last_actions': self.policy.last_actions.tolist() if self.policy else None,
+                'raw_actions': raw_actions.tolist(),
+                'delta_yaw': delta_yaw,
+                'delta_next_yaw': delta_next_yaw,
+            }
+            if self.policy_tick % 50 == 0:
+                print(f"  [Depth] embedding_norm={depth_embedding_norm:.3f}, "
+                      f"delta_yaw={delta_yaw:+.3f} rad")
+            depth_stats = {'norm': depth_embedding_norm}
+            self._log_sensor_data(depth_stats=depth_stats, policy_output=targets, extra_debug=extra_debug)
 
     def start(self):
-        """Start the control loop."""
+        """Start the control loop and the policy inference thread.
+
+        The control thread runs at 500 Hz and only does cheap work — state
+        machine, button handling, interpolation, motor publish. The policy
+        thread runs at 50 Hz and does all the heavy GPU inference; it
+        publishes the latest target into self.policy_target so the control
+        thread can read it without blocking on torch.
+        """
         self.running = True
         self.control_thread = RecurrentThread(
             interval=MOTOR_DT,
@@ -892,6 +1030,14 @@ class Go2Deployment:
         self.control_thread.Start()
         print("Control loop started")
 
+        self.policy_thread = threading.Thread(
+            target=self._policy_loop,
+            name="policy",
+            daemon=True,
+        )
+        self.policy_thread.start()
+        print("Policy inference thread started")
+
     def stop(self):
         """Stop everything."""
         print("Stopping...")
@@ -899,6 +1045,9 @@ class Go2Deployment:
 
         if self.control_thread is not None:
             self.control_thread.Wait()
+
+        if self.policy_thread is not None:
+            self.policy_thread.join(timeout=2.0)
 
         # Stop depth encoder process
         if self.depth_encoder_process is not None:

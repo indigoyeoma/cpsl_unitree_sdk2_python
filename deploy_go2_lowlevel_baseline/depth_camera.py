@@ -20,7 +20,8 @@ from config import (
     DEPTH_WIDTH, DEPTH_HEIGHT, DEPTH_FPS,
     CROP_TOP, CROP_BOTTOM, CROP_LEFT, CROP_RIGHT,
     DEPTH_OUTPUT_WIDTH, DEPTH_OUTPUT_HEIGHT,
-    DEPTH_NEAR, DEPTH_FAR
+    DEPTH_NEAR, DEPTH_FAR,
+    ENABLE_DEPTH_FILTERS,
 )
 
 
@@ -32,12 +33,16 @@ class DepthCamera:
     preprocessed frames for the vision policy.
     """
 
-    def __init__(self, enable_filters: bool = True):
+    def __init__(self, enable_filters: bool = ENABLE_DEPTH_FILTERS):
         """
         Initialize the depth camera.
 
         Args:
-            enable_filters: Whether to apply RealSense post-processing filters
+            enable_filters: Whether to apply RealSense post-processing filters.
+                            Defaults to config.ENABLE_DEPTH_FILTERS. Filters were
+                            NOT used in training, and spatial/temporal filtering
+                            adds 5–10 ms + ~1 frame of lag. Keep False unless a
+                            specific artifact justifies enabling them.
         """
         self.enable_filters = enable_filters
         self.pipeline = None
@@ -45,10 +50,13 @@ class DepthCamera:
         self.running = False
         self.thread = None
 
-        # Latest frame storage (thread-safe)
+        # Latest frame storage (thread-safe).
+        # Raw frame is only populated on demand (see request_raw_frame()) to
+        # avoid copying a 480x640 uint16 array every captured frame.
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
-        self._latest_raw_frame: Optional[np.ndarray] = None  # Raw frame before preprocessing
+        self._latest_raw_frame: Optional[np.ndarray] = None
+        self._capture_raw = False
         self._frame_timestamp: float = 0.0
 
         # Initialize filters if enabled
@@ -153,9 +161,13 @@ class DepthCamera:
                 processed = self._preprocess(depth_image)
 
                 # Store with thread safety
+                # Raw frame copy is skipped by default — it's only needed when
+                # the user explicitly requests saving depth images (a 480x640
+                # uint16 copy per frame was ~600 kB of wasted work).
                 with self._frame_lock:
                     self._latest_frame = processed
-                    self._latest_raw_frame = depth_image.copy()  # Store raw frame (in mm)
+                    if self._capture_raw:
+                        self._latest_raw_frame = depth_image.copy()
                     self._frame_timestamp = time.time()
 
             except Exception as e:
@@ -237,12 +249,25 @@ class DepthCamera:
                 return None
             return self._latest_frame.copy()
 
+    def set_capture_raw(self, enabled: bool):
+        """Toggle whether the capture thread also stores a copy of the raw frame.
+
+        Off by default to avoid a ~600 kB memcpy per frame. Callers that want
+        the raw frame (e.g. the Select-button save-to-disk path) should enable
+        this just before requesting a frame and disable it after.
+        """
+        with self._frame_lock:
+            self._capture_raw = enabled
+            if not enabled:
+                self._latest_raw_frame = None
+
     def get_raw_frame(self) -> Optional[np.ndarray]:
         """
         Get the latest raw depth frame (before preprocessing).
 
         Returns:
-            Raw depth image (H, W) in millimeters, or None if no frame
+            Raw depth image (H, W) in millimeters, or None if no frame.
+            Returns None if capture-raw was not enabled via set_capture_raw(True).
         """
         if not HAS_REALSENSE:
             return None
